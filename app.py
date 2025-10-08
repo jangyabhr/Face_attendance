@@ -5,7 +5,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 import io
-import base64
+import json
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Page configuration
 st.set_page_config(
@@ -26,22 +29,6 @@ st.markdown("""
         font-weight: bold;
     }
     .stButton>button:hover {background-color: #45a049;}
-    .stats-box {
-        background-color: #1e1e1e;
-        padding: 20px;
-        border-radius: 10px;
-        border-left: 5px solid #4CAF50;
-        margin: 10px 0;
-    }
-    .face-box {
-        border: 3px solid #FF9800;
-        cursor: pointer;
-        transition: all 0.3s;
-    }
-    .face-box:hover {
-        border-color: #4CAF50;
-        box-shadow: 0 0 10px #4CAF50;
-    }
     h1 {color: #4CAF50;}
     h2, h3 {color: #FF9800;}
 </style>
@@ -53,35 +40,239 @@ if 'roster' not in st.session_state:
 if 'faces' not in st.session_state:
     st.session_state.faces = []
 if 'assignments' not in st.session_state:
-    st.session_state.assignments = {}  # face_id -> roster_index
+    st.session_state.assignments = {}
 if 'photo' not in st.session_state:
     st.session_state.photo = None
 if 'photo_name' not in st.session_state:
     st.session_state.photo_name = None
+if 'face_memory' not in st.session_state:
+    st.session_state.face_memory = {}  # admission_no -> face_encoding
 if 'detection_params' not in st.session_state:
     st.session_state.detection_params = {
         'scaleFactor': 1.1,
         'minNeighbors': 5,
         'minSize': 40
     }
+if 'sheets_connected' not in st.session_state:
+    st.session_state.sheets_connected = False
+if 'spreadsheet_id' not in st.session_state:
+    st.session_state.spreadsheet_id = None
 
-# Helper Functions
-def load_roster(uploaded_file):
-    """Load and validate roster CSV"""
+# Google Sheets Functions
+def connect_to_sheets(credentials_dict, spreadsheet_id):
+    """Connect to Google Sheets"""
     try:
-        df = pd.read_csv(uploaded_file, dtype=str).fillna("")
-        required = {"Admission_No", "Name", "Section", "Roll_No"}
-        if not required.issubset(set(df.columns)):
-            st.error(f"❌ Roster must contain columns: {', '.join(required)}")
-            return None
-        st.session_state.roster = df
-        return df
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=['https://www.googleapis.com/auth/spreadsheets']
+        )
+        service = build('sheets', 'v4', credentials=credentials)
+        st.session_state.sheets_service = service
+        st.session_state.spreadsheet_id = spreadsheet_id
+        st.session_state.sheets_connected = True
+        return True
     except Exception as e:
-        st.error(f"❌ Error loading roster: {str(e)}")
+        st.error(f"Connection failed: {str(e)}")
+        return False
+
+def read_sheet(sheet_name):
+    """Read data from Google Sheet"""
+    try:
+        service = st.session_state.sheets_service
+        spreadsheet_id = st.session_state.spreadsheet_id
+        
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_name}!A:Z"
+        ).execute()
+        
+        values = result.get('values', [])
+        if not values:
+            return None
+        
+        df = pd.DataFrame(values[1:], columns=values[0])
+        return df
+    except HttpError as e:
+        if e.resp.status == 404:
+            return None
+        st.error(f"Error reading sheet: {str(e)}")
         return None
 
+def write_sheet(sheet_name, df):
+    """Write data to Google Sheet"""
+    try:
+        service = st.session_state.sheets_service
+        spreadsheet_id = st.session_state.spreadsheet_id
+        
+        # Convert DataFrame to list of lists
+        values = [df.columns.tolist()] + df.values.tolist()
+        
+        body = {'values': values}
+        
+        # Clear existing data
+        service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_name}!A:Z"
+        ).execute()
+        
+        # Write new data
+        result = service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_name}!A1",
+            valueInputOption='RAW',
+            body=body
+        ).execute()
+        
+        return True
+    except Exception as e:
+        st.error(f"Error writing sheet: {str(e)}")
+        return False
+
+def init_master_attendance(roster):
+    """Initialize master attendance sheet"""
+    df = roster.copy()
+    df['Total_Present'] = '0'
+    df['Total_Absent'] = '0'
+    df['Attendance_%'] = '0'
+    return df
+
+def update_master_attendance(roster, assignments, date_str):
+    """Update master attendance with today's data"""
+    # Read existing master sheet
+    master = read_sheet("Attendance")
+    
+    if master is None or master.empty:
+        master = init_master_attendance(roster)
+    
+    # Add date column if doesn't exist
+    if date_str not in master.columns:
+        master[date_str] = 'A'
+    
+    # Update attendance
+    present_indices = set(assignments.values())
+    
+    for idx, row in roster.iterrows():
+        admission_no = row['Admission_No']
+        
+        # Find in master
+        mask = master['Admission_No'] == admission_no
+        
+        if mask.any():
+            master_idx = master[mask].index[0]
+            
+            # Check if already marked today
+            current_status = master.loc[master_idx, date_str]
+            
+            if current_status not in ['P', 'A']:  # Not marked yet
+                if idx in present_indices:
+                    master.loc[master_idx, date_str] = 'P'
+                    master.loc[master_idx, 'Total_Present'] = str(int(master.loc[master_idx, 'Total_Present']) + 1)
+                else:
+                    master.loc[master_idx, date_str] = 'A'
+                    master.loc[master_idx, 'Total_Absent'] = str(int(master.loc[master_idx, 'Total_Absent']) + 1)
+                
+                # Calculate percentage
+                total_p = int(master.loc[master_idx, 'Total_Present'])
+                total_a = int(master.loc[master_idx, 'Total_Absent'])
+                total_days = total_p + total_a
+                
+                if total_days > 0:
+                    pct = round((total_p / total_days) * 100, 2)
+                    master.loc[master_idx, 'Attendance_%'] = str(pct)
+        else:
+            # Add new student
+            new_row = row.copy()
+            new_row[date_str] = 'P' if idx in present_indices else 'A'
+            new_row['Total_Present'] = '1' if idx in present_indices else '0'
+            new_row['Total_Absent'] = '0' if idx in present_indices else '1'
+            new_row['Attendance_%'] = '100' if idx in present_indices else '0'
+            master = pd.concat([master, pd.DataFrame([new_row])], ignore_index=True)
+    
+    # Save to Google Sheets
+    write_sheet("Attendance", master)
+    return master
+
+def save_face_memory():
+    """Save face encodings to Google Sheets"""
+    if not st.session_state.face_memory:
+        return
+    
+    # Convert to DataFrame
+    data = []
+    for admission_no, encoding in st.session_state.face_memory.items():
+        # Convert numpy array to string
+        encoding_str = ','.join(map(str, encoding.tolist()))
+        data.append({
+            'Admission_No': admission_no,
+            'Encoding': encoding_str
+        })
+    
+    df = pd.DataFrame(data)
+    write_sheet("FaceMemory", df)
+
+def load_face_memory():
+    """Load face encodings from Google Sheets"""
+    df = read_sheet("FaceMemory")
+    
+    if df is None or df.empty:
+        return {}
+    
+    memory = {}
+    for _, row in df.iterrows():
+        admission_no = row['Admission_No']
+        encoding_str = row['Encoding']
+        
+        # Convert string back to numpy array
+        encoding = np.array([float(x) for x in encoding_str.split(',')])
+        memory[admission_no] = encoding
+    
+    return memory
+
+# Face detection and recognition
+def get_simple_face_encoding(image_array, face):
+    """Create simple face encoding"""
+    x, y, w, h = face['x'], face['y'], face['w'], face['h']
+    face_crop = image_array[y:y+h, x:x+w]
+    
+    face_resized = cv2.resize(face_crop, (100, 100))
+    gray = cv2.cvtColor(face_resized, cv2.COLOR_RGB2GRAY)
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+    hist = cv2.normalize(hist, hist).flatten()
+    
+    return hist
+
+def match_face_to_saved(current_encoding, saved_encodings, threshold=0.65):
+    """Match face to saved encodings"""
+    best_match = None
+    best_score = 0
+    
+    for admission_no, saved_encoding in saved_encodings.items():
+        score = cv2.compareHist(current_encoding, saved_encoding, cv2.HISTCMP_CORREL)
+        
+        if score > best_score and score > threshold:
+            best_score = score
+            best_match = admission_no
+    
+    return best_match, best_score
+
+def auto_assign_faces(faces, image_array, roster, saved_encodings):
+    """Auto-assign faces based on saved encodings"""
+    assignments = {}
+    
+    for face in faces:
+        encoding = get_simple_face_encoding(image_array, face)
+        matched_admission, confidence = match_face_to_saved(encoding, saved_encodings)
+        
+        if matched_admission:
+            mask = roster['Admission_No'] == matched_admission
+            if mask.any():
+                roster_idx = roster[mask].index[0]
+                assignments[face['id']] = roster_idx
+    
+    return assignments
+
 def detect_faces(image_array, params):
-    """Detect faces in image using OpenCV"""
+    """Detect faces using OpenCV"""
     gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     
@@ -105,24 +296,21 @@ def detect_faces(image_array, params):
     return face_list
 
 def draw_faces_on_image(image, faces, assignments, roster):
-    """Draw rectangles and labels on image"""
+    """Draw faces on image"""
     img_draw = image.copy()
     draw = ImageDraw.Draw(img_draw)
     
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
     except:
-        font = ImageFont.load_default()
         font_small = ImageFont.load_default()
     
     for face in faces:
         face_id = face['id']
         x, y, w, h = face['x'], face['y'], face['w'], face['h']
         
-        # Check if assigned
         if face_id in assignments:
-            color = "#4CAF50"  # Green for assigned
+            color = "#4CAF50"
             idx = assignments[face_id]
             if roster is not None and idx < len(roster):
                 name = roster.iloc[idx]['Name']
@@ -131,14 +319,12 @@ def draw_faces_on_image(image, faces, assignments, roster):
                 label = f"#{face_id} ✓"
             width = 4
         else:
-            color = "#FF9800"  # Orange for unassigned
+            color = "#FF9800"
             label = f"#{face_id}"
             width = 3
         
-        # Draw rectangle
         draw.rectangle([x, y, x+w, y+h], outline=color, width=width)
         
-        # Draw label with background
         bbox = draw.textbbox((x, y-25), label, font=font_small)
         draw.rectangle([bbox[0]-5, bbox[1]-2, bbox[2]+5, bbox[3]+2], fill=color)
         draw.text((x, y-25), label, fill="white", font=font_small)
@@ -146,7 +332,7 @@ def draw_faces_on_image(image, faces, assignments, roster):
     return img_draw
 
 def search_roster(roster, query):
-    """Search roster by name, admission number, section, or roll number"""
+    """Search roster"""
     if not query:
         return roster
     
@@ -159,146 +345,215 @@ def search_roster(roster, query):
     )
     return roster[mask]
 
-def generate_attendance_report(roster, assignments, photo_name):
-    """Generate attendance DataFrame"""
-    present_indices = set(assignments.values())
-    
-    attendance = []
-    for idx, row in roster.iterrows():
-        attendance.append({
-            'Admission_No': row['Admission_No'],
-            'Roll_No': row['Roll_No'],
-            'Name': row['Name'],
-            'Section': row['Section'],
-            'Status': 'Present' if idx in present_indices else 'Absent',
-            'Date': datetime.now().strftime('%Y-%m-%d'),
-            'Time': datetime.now().strftime('%H:%M:%S'),
-            'Photo': photo_name or ''
-        })
-    
-    return pd.DataFrame(attendance)
-
-def get_download_link(df, filename, file_format='xlsx'):
-    """Generate download link for DataFrame"""
-    if file_format == 'xlsx':
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Attendance')
-        output.seek(0)
-        b64 = base64.b64encode(output.read()).decode()
-        mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    else:  # CSV
-        output = io.StringIO()
-        df.to_csv(output, index=False)
-        b64 = base64.b64encode(output.getvalue().encode()).decode()
-        mime_type = 'text/csv'
-    
-    return f'data:{mime_type};base64,{b64}'
-
 # Main App
 def main():
-    st.title("📸 Face Tap Attendance System")
+    st.title("📸 Face Attendance with Google Sheets")
+    
+    # Setup instructions
+    with st.expander("⚙️ SETUP INSTRUCTIONS (First Time Only)", expanded=not st.session_state.sheets_connected):
+        st.markdown("""
+        ### 📋 One-Time Setup (5 minutes):
+        
+        **Step 1: Create Google Sheet**
+        1. Go to [Google Sheets](https://sheets.google.com)
+        2. Create new sheet named "School Attendance" (or any name)
+        3. Note the Spreadsheet ID from URL: `https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit`
+        
+        **Step 2: Enable Google Sheets API**
+        1. Go to [Google Cloud Console](https://console.cloud.google.com)
+        2. Create new project (or select existing)
+        3. Enable "Google Sheets API"
+        4. Create Service Account:
+           - Go to "Credentials" → "Create Credentials" → "Service Account"
+           - Name it "attendance-app"
+           - Create Key (JSON format)
+           - Download the JSON file
+        
+        **Step 3: Share Sheet with Service Account**
+        1. Open your Google Sheet
+        2. Click "Share" button
+        3. Add the service account email (from JSON: `client_email`)
+        4. Give "Editor" permission
+        
+        **Step 4: Upload Credentials Below** ⬇️
+        
+        ### 💡 After Setup:
+        - ✅ Data saved permanently in Google Sheets
+        - ✅ Access from anywhere
+        - ✅ Multiple teachers can use (just share the sheet)
+        - ✅ Automatic backups (Google's infrastructure)
+        """)
+    
     st.markdown("---")
+    
+    # Connection setup
+    if not st.session_state.sheets_connected:
+        st.subheader("🔗 Connect to Google Sheets")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            credentials_file = st.file_uploader(
+                "Upload Service Account JSON",
+                type=['json'],
+                help="The JSON file downloaded from Google Cloud Console"
+            )
+        
+        with col2:
+            spreadsheet_id = st.text_input(
+                "Spreadsheet ID",
+                help="From your Google Sheet URL",
+                placeholder="1a2b3c4d5e6f7g8h9i0j..."
+            )
+        
+        if credentials_file and spreadsheet_id:
+            if st.button("🔗 Connect", use_container_width=True):
+                try:
+                    credentials_dict = json.load(credentials_file)
+                    if connect_to_sheets(credentials_dict, spreadsheet_id):
+                        st.success("✅ Connected to Google Sheets!")
+                        
+                        # Load roster if exists
+                        roster = read_sheet("Roster")
+                        if roster is not None and not roster.empty:
+                            st.session_state.roster = roster
+                            st.success(f"✅ Loaded roster: {len(roster)} students")
+                        
+                        # Load face memory
+                        st.session_state.face_memory = load_face_memory()
+                        if st.session_state.face_memory:
+                            st.info(f"🧠 Loaded {len(st.session_state.face_memory)} saved faces")
+                        
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Connection failed: {str(e)}")
+        
+        st.stop()
+    
+    # Main interface (after connected)
+    st.success(f"🔗 Connected to Google Sheets")
     
     # Sidebar
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header("⚙️ Daily Controls")
         
-        # Roster Upload
-        st.subheader("1️⃣ Load Roster")
-        roster_file = st.file_uploader(
-            "Upload CSV (Admission_No, Name, Section, Roll_No)",
-            type=['csv'],
-            help="CSV must contain: Admission_No, Name, Section, Roll_No"
-        )
-        
-        if roster_file:
-            roster = load_roster(roster_file)
-            if roster is not None:
-                st.success(f"✅ Loaded {len(roster)} students")
+        st.metric("📅 Date", datetime.now().strftime('%b %d, %Y'))
         
         st.markdown("---")
         
-        # Photo Upload
-        st.subheader("2️⃣ Upload Photo")
+        # Roster management
+        st.subheader("👥 Roster")
+        
+        if st.button("📥 Load from Sheets", use_container_width=True):
+            roster = read_sheet("Roster")
+            if roster is not None and not roster.empty:
+                st.session_state.roster = roster
+                st.success(f"✅ Loaded {len(roster)} students")
+            else:
+                st.info("No roster found. Upload CSV below.")
+        
+        roster_file = st.file_uploader(
+            "Or Upload New Roster CSV",
+            type=['csv'],
+            help="Columns: Admission_No, Name, Section, Roll_No"
+        )
+        
+        if roster_file:
+            try:
+                df = pd.read_csv(roster_file, dtype=str).fillna("")
+                required = {"Admission_No", "Name", "Section", "Roll_No"}
+                
+                if not required.issubset(set(df.columns)):
+                    st.error(f"❌ Must have: {', '.join(required)}")
+                else:
+                    st.session_state.roster = df
+                    # Save to Google Sheets
+                    if write_sheet("Roster", df):
+                        st.success(f"✅ Roster saved: {len(df)} students")
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+        
+        if st.session_state.roster is not None:
+            st.metric("Students", len(st.session_state.roster))
+        
+        st.markdown("---")
+        
+        # Photo upload
+        st.subheader("📸 Today's Photo")
+        
         photo_file = st.file_uploader(
             "Upload classroom photo",
-            type=['jpg', 'jpeg', 'png'],
-            help="Take a clear group photo with good lighting"
+            type=['jpg', 'jpeg', 'png']
         )
         
         if photo_file:
             image = Image.open(photo_file).convert('RGB')
             st.session_state.photo = np.array(image)
             st.session_state.photo_name = photo_file.name
-            st.success(f"✅ Photo loaded: {photo_file.name}")
+            st.success("✅ Photo loaded")
         
         st.markdown("---")
         
-        # Detection Settings
-        st.subheader("3️⃣ Detection Settings")
-        with st.expander("🔧 Adjust Parameters", expanded=False):
+        # Detection
+        st.subheader("🔍 Detection")
+        
+        with st.expander("⚙️ Settings"):
             st.session_state.detection_params['scaleFactor'] = st.slider(
-                "Scale Factor",
-                min_value=1.05,
-                max_value=1.5,
-                value=1.1,
-                step=0.05,
-                help="Lower = more faces (slower)"
+                "Scale Factor", 1.05, 1.5, 1.1, 0.05
             )
-            
             st.session_state.detection_params['minNeighbors'] = st.slider(
-                "Min Neighbors",
-                min_value=3,
-                max_value=10,
-                value=5,
-                help="Lower = more faces (less accurate)"
+                "Min Neighbors", 3, 10, 5
             )
-            
             st.session_state.detection_params['minSize'] = st.slider(
-                "Min Face Size",
-                min_value=20,
-                max_value=100,
-                value=40,
-                help="Smaller = detect distant faces"
+                "Min Size", 20, 100, 40
             )
         
-        # Detect Faces Button
-        if st.button("🔍 Detect Faces", use_container_width=True):
+        if st.button("🔍 Detect & Auto-Assign", use_container_width=True):
             if st.session_state.photo is None:
-                st.error("❌ Please upload a photo first")
+                st.error("❌ Upload photo first")
+            elif st.session_state.roster is None:
+                st.error("❌ Load roster first")
             else:
-                with st.spinner("Detecting faces..."):
+                with st.spinner("Detecting..."):
                     faces = detect_faces(st.session_state.photo, st.session_state.detection_params)
                     st.session_state.faces = faces
-                    st.session_state.assignments = {}  # Reset assignments
-                
-                if faces:
-                    st.success(f"✅ Detected {len(faces)} faces")
-                else:
-                    st.warning("⚠️ No faces detected. Try adjusting parameters.")
+                    
+                    if faces:
+                        st.success(f"✅ Found {len(faces)} faces")
+                        
+                        if st.session_state.face_memory:
+                            with st.spinner("🧠 Auto-assigning..."):
+                                auto = auto_assign_faces(
+                                    faces,
+                                    st.session_state.photo,
+                                    st.session_state.roster,
+                                    st.session_state.face_memory
+                                )
+                                st.session_state.assignments = auto
+                                if auto:
+                                    st.success(f"🎯 Auto-assigned {len(auto)} faces!")
+                        else:
+                            st.session_state.assignments = {}
+                            st.info("💡 First time: Teach system by assigning manually")
+                    else:
+                        st.warning("⚠️ No faces found")
         
         st.markdown("---")
         
-        # Actions
-        st.subheader("4️⃣ Actions")
-        
-        if st.button("🗑️ Clear All Assignments", use_container_width=True):
+        if st.button("🗑️ Clear Assignments", use_container_width=True):
             st.session_state.assignments = {}
             st.rerun()
         
-        if st.button("📊 View Statistics", use_container_width=True):
-            if st.session_state.roster is not None:
-                st.session_state.show_stats = True
+        if st.button("📊 View Master Sheet", use_container_width=True):
+            st.session_state.show_master = True
     
-    # Main Content Area
+    # Main content
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("📷 Classroom Photo")
+        st.subheader("📷 Classroom View")
         
         if st.session_state.photo is not None and st.session_state.faces:
-            # Draw faces on image
             img_pil = Image.fromarray(st.session_state.photo)
             img_with_faces = draw_faces_on_image(
                 img_pil,
@@ -307,173 +562,7 @@ def main():
                 st.session_state.roster
             )
             
-            st.image(img_with_faces, use_container_width=True, caption="Click on face IDs in the list to assign students →")
+            st.image(img_with_faces, use_container_width=True)
             
-            # Face assignment info
-            assigned_count = len(st.session_state.assignments)
-            total_faces = len(st.session_state.faces)
-            st.info(f"🟢 Assigned: {assigned_count} | 🟠 Unassigned: {total_faces - assigned_count}")
-            
-        elif st.session_state.photo is not None:
-            st.image(st.session_state.photo, use_container_width=True, caption="Photo loaded - Click 'Detect Faces' in sidebar")
-        else:
-            st.info("👆 Upload a photo using the sidebar")
-    
-    with col2:
-        st.subheader("👥 Face Assignment")
-        
-        if st.session_state.faces and st.session_state.roster is not None:
-            # Show unassigned faces
-            unassigned_faces = [f for f in st.session_state.faces if f['id'] not in st.session_state.assignments]
-            
-            if unassigned_faces:
-                st.markdown("### 🟠 Unassigned Faces")
-                
-                for face in unassigned_faces:
-                    with st.expander(f"Face #{face['id']}", expanded=False):
-                        # Search box
-                        search_query = st.text_input(
-                            "Search student",
-                            key=f"search_{face['id']}",
-                            placeholder="Name, Admission No, Section, or Roll No"
-                        )
-                        
-                        # Filter roster
-                        filtered_roster = search_roster(st.session_state.roster, search_query)
-                        
-                        if len(filtered_roster) > 0:
-                            # Create display format
-                            display_options = []
-                            for idx, row in filtered_roster.iterrows():
-                                display = f"{row['Name']} ({row['Section']}) - Roll: {row['Roll_No']} - Adm: {row['Admission_No']}"
-                                display_options.append((display, idx))
-                            
-                            # Select student
-                            selected = st.selectbox(
-                                "Select student",
-                                options=display_options,
-                                format_func=lambda x: x[0],
-                                key=f"select_{face['id']}"
-                            )
-                            
-                            if st.button(f"✅ Assign to Face #{face['id']}", key=f"assign_{face['id']}", use_container_width=True):
-                                # Check for duplicates
-                                idx = selected[1]
-                                if idx in st.session_state.assignments.values():
-                                    st.warning("⚠️ Student already assigned to another face!")
-                                else:
-                                    st.session_state.assignments[face['id']] = idx
-                                    st.success(f"✅ Assigned {st.session_state.roster.iloc[idx]['Name']}")
-                                    st.rerun()
-                        else:
-                            st.warning("No students found")
-            else:
-                st.success("✅ All faces assigned!")
-            
-            st.markdown("---")
-            
-            # Show assigned faces
-            if st.session_state.assignments:
-                st.markdown("### 🟢 Assigned Students")
-                
-                for face_id, roster_idx in st.session_state.assignments.items():
-                    student = st.session_state.roster.iloc[roster_idx]
-                    col_a, col_b = st.columns([4, 1])
-                    
-                    with col_a:
-                        st.text(f"#{face_id}: {student['Name']} ({student['Section']})")
-                    
-                    with col_b:
-                        if st.button("❌", key=f"remove_{face_id}"):
-                            del st.session_state.assignments[face_id]
-                            st.rerun()
-        
-        elif st.session_state.faces:
-            st.info("👈 Load roster CSV first")
-        else:
-            st.info("👈 Detect faces first")
-    
-    # Statistics Section
-    if st.session_state.roster is not None and st.session_state.faces:
-        st.markdown("---")
-        st.subheader("📊 Attendance Statistics")
-        
-        total_students = len(st.session_state.roster)
-        present_count = len(set(st.session_state.assignments.values()))
-        absent_count = total_students - present_count
-        present_pct = (present_count / total_students * 100) if total_students > 0 else 0
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total Students", total_students)
-        with col2:
-            st.metric("Present", present_count, f"{present_pct:.1f}%")
-        with col3:
-            st.metric("Absent", absent_count, f"{100-present_pct:.1f}%")
-        with col4:
-            st.metric("Faces Detected", len(st.session_state.faces))
-    
-    # Save Attendance Section
-    if st.session_state.roster is not None and st.session_state.assignments:
-        st.markdown("---")
-        st.subheader("💾 Save Attendance")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("📥 Download Excel", use_container_width=True):
-                df = generate_attendance_report(
-                    st.session_state.roster,
-                    st.session_state.assignments,
-                    st.session_state.photo_name
-                )
-                
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Attendance')
-                output.seek(0)
-                
-                st.download_button(
-                    label="📥 Download XLSX",
-                    data=output,
-                    file_name=f"attendance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-        
-        with col2:
-            if st.button("📥 Download CSV", use_container_width=True):
-                df = generate_attendance_report(
-                    st.session_state.roster,
-                    st.session_state.assignments,
-                    st.session_state.photo_name
-                )
-                
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=csv,
-                    file_name=f"attendance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-        
-        with col3:
-            if st.button("👁️ Preview Report", use_container_width=True):
-                df = generate_attendance_report(
-                    st.session_state.roster,
-                    st.session_state.assignments,
-                    st.session_state.photo_name
-                )
-                st.dataframe(df, use_container_width=True)
-    
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        "<center>Made with ❤️ | Face Detection Attendance System v2.0</center>",
-        unsafe_allow_html=True
-    )
-
-if __name__ == "__main__":
-    main()
+            assigned = len(st.session_state.assignments)
+      
