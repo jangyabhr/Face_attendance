@@ -1,7 +1,12 @@
 streamlit>=1.32
-opencv-python-headless>=4.8
-pillow>=10.0
 pandas>=2.1
 numpy>=1.26
 xlsxwriter>=3.1
 openpyxl>=3.1
+pillow>=10.0
+opencv-python-headless>=4.8
+google-api-python-client>=2.137
+google-auth>=2.27
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
+protobuf>=4.25
