@@ -255,40 +255,79 @@ def load_face_memory():
         return {}
     
     memory = {}
-    for _, row in df.iterrows():
-        admission_no = row['Admission_No']
-        encoding_str = row['Encoding']
-        
-        # Convert string back to numpy array
-        encoding = np.array([float(x) for x in encoding_str.split(',')])
-        memory[admission_no] = encoding
+    try:
+        for _, row in df.iterrows():
+            admission_no = row['Admission_No']
+            encoding_str = row['Encoding']
+            
+            # Convert string back to numpy array
+            encoding = np.array([float(x) for x in encoding_str.split(',')], dtype=np.float32)
+            memory[admission_no] = encoding
+    except Exception as e:
+        st.warning(f"Error loading face memory: {str(e)}")
+        return {}
     
     return memory
 
 # Face detection and recognition
 def get_simple_face_encoding(image_array, face):
     """Create simple face encoding"""
-    x, y, w, h = face['x'], face['y'], face['w'], face['h']
-    face_crop = image_array[y:y+h, x:x+w]
-    
-    face_resized = cv2.resize(face_crop, (100, 100))
-    gray = cv2.cvtColor(face_resized, cv2.COLOR_RGB2GRAY)
-    hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-    hist = cv2.normalize(hist, hist).flatten()
-    
-    return hist
+    try:
+        x, y, w, h = face['x'], face['y'], face['w'], face['h']
+        
+        # Ensure coordinates are within image bounds
+        x = max(0, x)
+        y = max(0, y)
+        w = min(w, image_array.shape[1] - x)
+        h = min(h, image_array.shape[0] - y)
+        
+        face_crop = image_array[y:y+h, x:x+w]
+        
+        # Check if crop is valid
+        if face_crop.size == 0:
+            return None
+        
+        face_resized = cv2.resize(face_crop, (100, 100))
+        gray = cv2.cvtColor(face_resized, cv2.COLOR_RGB2GRAY)
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        
+        return hist.astype(np.float32)
+    except Exception as e:
+        st.warning(f"Error creating face encoding: {str(e)}")
+        return None
 
 def match_face_to_saved(current_encoding, saved_encodings, threshold=0.65):
     """Match face to saved encodings"""
     best_match = None
     best_score = 0
     
-    for admission_no, saved_encoding in saved_encodings.items():
-        score = cv2.compareHist(current_encoding, saved_encoding, cv2.HISTCMP_CORREL)
-        
-        if score > best_score and score > threshold:
-            best_score = score
-            best_match = admission_no
+    try:
+        for admission_no, saved_encoding in saved_encodings.items():
+            # Ensure both encodings are numpy arrays with correct shape
+            if not isinstance(current_encoding, np.ndarray):
+                current_encoding = np.array(current_encoding, dtype=np.float32)
+            if not isinstance(saved_encoding, np.ndarray):
+                saved_encoding = np.array(saved_encoding, dtype=np.float32)
+            
+            # Ensure they're the same shape
+            if current_encoding.shape != saved_encoding.shape:
+                continue
+            
+            # Reshape if needed (OpenCV expects shape (256, 1))
+            if len(current_encoding.shape) == 1:
+                current_encoding = current_encoding.reshape(-1, 1)
+            if len(saved_encoding.shape) == 1:
+                saved_encoding = saved_encoding.reshape(-1, 1)
+            
+            score = cv2.compareHist(current_encoding, saved_encoding, cv2.HISTCMP_CORREL)
+            
+            if score > best_score and score > threshold:
+                best_score = score
+                best_match = admission_no
+    except Exception as e:
+        st.warning(f"Face matching error: {str(e)}")
+        return None, 0
     
     return best_match, best_score
 
