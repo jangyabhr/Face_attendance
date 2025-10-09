@@ -386,30 +386,17 @@ def main():
     
     st.markdown("---")
     
-    # Connection setup
+    # Connection setup - Auto-connect using Streamlit secrets
     if not st.session_state.sheets_connected:
         st.subheader("🔗 Connect to Google Sheets")
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            credentials_file = st.file_uploader(
-                "Upload Service Account JSON",
-                type=['json'],
-                help="The JSON file downloaded from Google Cloud Console"
-            )
-        
-        with col2:
-            spreadsheet_id = st.text_input(
-                "Spreadsheet ID",
-                help="From your Google Sheet URL",
-                placeholder="1a2b3c4d5e6f7g8h9i0j..."
-            )
-        
-        if credentials_file and spreadsheet_id:
-            if st.button("🔗 Connect", use_container_width=True):
-                try:
-                    credentials_dict = json.load(credentials_file)
+        # Try to auto-connect using secrets
+        try:
+            if "gcp_service_account" in st.secrets and "spreadsheet_id" in st.secrets:
+                with st.spinner("Connecting to Google Sheets..."):
+                    credentials_dict = dict(st.secrets["gcp_service_account"])
+                    spreadsheet_id = st.secrets["spreadsheet_id"]
+                    
                     if connect_to_sheets(credentials_dict, spreadsheet_id):
                         st.success("✅ Connected to Google Sheets!")
                         
@@ -425,10 +412,33 @@ def main():
                             st.info(f"🧠 Loaded {len(st.session_state.face_memory)} saved faces")
                         
                         st.rerun()
-                except Exception as e:
-                    st.error(f"Connection failed: {str(e)}")
-        
-        st.stop()
+            else:
+                st.error("❌ Secrets not configured!")
+                st.info("👉 Add credentials in Streamlit Cloud app settings → Secrets")
+                with st.expander("📋 How to Configure Secrets"):
+                    st.code("""
+# In Streamlit Cloud: Settings → Secrets
+# Add this configuration:
+
+spreadsheet_id = "YOUR_SPREADSHEET_ID"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "your-project-id"
+private_key_id = "your-private-key-id"
+private_key = "-----BEGIN PRIVATE KEY-----\\nYOUR_PRIVATE_KEY\\n-----END PRIVATE KEY-----\\n"
+client_email = "your-service-account@your-project.iam.gserviceaccount.com"
+client_id = "your-client-id"
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
+                    """, language="toml")
+                st.stop()
+        except Exception as e:
+            st.error(f"Connection failed: {str(e)}")
+            st.info("Check your secrets configuration")
+            st.stop()
     
     # Main interface (after connected)
     st.success(f"🔗 Connected to Google Sheets")
@@ -565,4 +575,159 @@ def main():
             st.image(img_with_faces, use_container_width=True)
             
             assigned = len(st.session_state.assignments)
-      
+            total = len(st.session_state.faces)
+            st.info(f"🟢 Assigned: {assigned} | 🟠 Pending: {total - assigned}")
+            
+        elif st.session_state.photo is not None:
+            st.image(st.session_state.photo, use_container_width=True)
+        else:
+            st.info("👈 Upload photo to begin")
+    
+    with col2:
+        st.subheader("👤 Assign Faces")
+        
+        if st.session_state.faces and st.session_state.roster is not None:
+            unassigned = [f for f in st.session_state.faces if f['id'] not in st.session_state.assignments]
+            
+            if unassigned:
+                st.markdown(f"### 🟠 Unassigned ({len(unassigned)})")
+                
+                for face in unassigned[:3]:  # Show max 3 at once
+                    with st.expander(f"Face #{face['id']}", expanded=True):
+                        search = st.text_input(
+                            "Search",
+                            key=f"s_{face['id']}",
+                            placeholder="Name, Roll..."
+                        )
+                        
+                        filtered = search_roster(st.session_state.roster, search)
+                        
+                        if len(filtered) > 0:
+                            options = []
+                            for idx, row in filtered.iterrows():
+                                disp = f"{row['Name']} ({row['Section']}) - R:{row['Roll_No']}"
+                                options.append((disp, idx))
+                            
+                            selected = st.selectbox(
+                                "Student",
+                                options=options,
+                                format_func=lambda x: x[0],
+                                key=f"sel_{face['id']}"
+                            )
+                            
+                            if st.button("✅ Assign", key=f"a_{face['id']}", use_container_width=True):
+                                idx = selected[1]
+                                admission_no = st.session_state.roster.iloc[idx]['Admission_No']
+                                
+                                st.session_state.assignments[face['id']] = idx
+                                
+                                # Learn face
+                                encoding = get_simple_face_encoding(st.session_state.photo, face)
+                                st.session_state.face_memory[admission_no] = encoding
+                                
+                                st.success("✅ Assigned & Learned!")
+                                st.rerun()
+                
+                if len(unassigned) > 3:
+                    st.info(f"📋 {len(unassigned) - 3} more faces to assign...")
+            else:
+                st.success("✅ All assigned!")
+            
+            st.markdown("---")
+            
+            if st.session_state.assignments:
+                st.markdown(f"### 🟢 Assigned ({len(st.session_state.assignments)})")
+                
+                for face_id, idx in list(st.session_state.assignments.items())[:5]:
+                    student = st.session_state.roster.iloc[idx]
+                    col_a, col_b = st.columns([4, 1])
+                    
+                    with col_a:
+                        st.text(f"#{face_id}: {student['Name']}")
+                    with col_b:
+                        if st.button("❌", key=f"rm_{face_id}"):
+                            del st.session_state.assignments[face_id]
+                            st.rerun()
+    
+    # Save section
+    if st.session_state.roster is not None and st.session_state.assignments:
+        st.markdown("---")
+        st.subheader("💾 Save Attendance")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            present = len(set(st.session_state.assignments.values()))
+            total = len(st.session_state.roster)
+            st.metric("Present", f"{present}/{total}")
+        
+        with col2:
+            pct = (present/total*100) if total > 0 else 0
+            st.metric("Rate", f"{pct:.1f}%")
+        
+        with col3:
+            learned = len(st.session_state.face_memory)
+            st.metric("Learned", learned)
+        
+        if st.button("✅ SAVE TO GOOGLE SHEETS", use_container_width=True, type="primary"):
+            with st.spinner("Saving..."):
+                today = datetime.now().strftime('%Y-%m-%d')
+                
+                # Update master attendance
+                master = update_master_attendance(
+                    st.session_state.roster,
+                    st.session_state.assignments,
+                    today
+                )
+                
+                # Save face memory
+                save_face_memory()
+                
+                st.success(f"✅ Saved for {today}!")
+                st.balloons()
+                st.info(f"📊 {present} present, {total-present} absent")
+    
+    # View master
+    if st.session_state.get('show_master'):
+        st.markdown("---")
+        st.subheader("📊 Master Attendance Sheet")
+        
+        master = read_sheet("Attendance")
+        if master is not None and not master.empty:
+            st.dataframe(master, use_container_width=True, height=400)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                csv = master.to_csv(index=False)
+                st.download_button(
+                    "📥 CSV",
+                    csv,
+                    f"attendance_{datetime.now().strftime('%Y%m%d')}.csv",
+                    use_container_width=True
+                )
+            
+            with col2:
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    master.to_excel(writer, index=False)
+                output.seek(0)
+                
+                st.download_button(
+                    "📥 Excel",
+                    output,
+                    f"attendance_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    use_container_width=True
+                )
+        else:
+            st.info("No data yet")
+        
+        if st.button("Close"):
+            st.session_state.show_master = False
+            st.rerun()
+    
+    st.markdown("---")
+    st.markdown("<center>📚 Face Attendance System | Data in Google Sheets ☁️</center>", unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    main()
