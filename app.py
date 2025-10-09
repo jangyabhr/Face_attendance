@@ -98,22 +98,59 @@ def read_sheet(sheet_name):
         st.error(f"Error reading sheet: {str(e)}")
         return None
 
+def create_sheet_if_not_exists(sheet_name):
+    """Create a new sheet tab if it doesn't exist"""
+    try:
+        service = st.session_state.sheets_service
+        spreadsheet_id = st.session_state.spreadsheet_id
+        
+        # Get existing sheets
+        spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        existing_sheets = [sheet['properties']['title'] for sheet in spreadsheet.get('sheets', [])]
+        
+        # Create if doesn't exist
+        if sheet_name not in existing_sheets:
+            request_body = {
+                'requests': [{
+                    'addSheet': {
+                        'properties': {
+                            'title': sheet_name
+                        }
+                    }
+                }]
+            }
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body=request_body
+            ).execute()
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Error creating sheet: {str(e)}")
+        return False
+
 def write_sheet(sheet_name, df):
     """Write data to Google Sheet"""
     try:
         service = st.session_state.sheets_service
         spreadsheet_id = st.session_state.spreadsheet_id
         
+        # Ensure sheet exists
+        create_sheet_if_not_exists(sheet_name)
+        
         # Convert DataFrame to list of lists
         values = [df.columns.tolist()] + df.values.tolist()
         
         body = {'values': values}
         
-        # Clear existing data
-        service.spreadsheets().values().clear(
-            spreadsheetId=spreadsheet_id,
-            range=f"{sheet_name}!A:Z"
-        ).execute()
+        # Try to clear existing data (if sheet has data)
+        try:
+            service.spreadsheets().values().clear(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!A:Z"
+            ).execute()
+        except:
+            pass  # Sheet might be empty, that's okay
         
         # Write new data
         result = service.spreadsheets().values().update(
@@ -594,10 +631,37 @@ client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
                 
                 for face in unassigned[:3]:  # Show max 3 at once
                     with st.expander(f"Face #{face['id']}", expanded=True):
+                        # Show face thumbnail
+                        try:
+                            x, y, w, h = face['x'], face['y'], face['w'], face['h']
+                            padding = 20
+                            y1 = max(0, y - padding)
+                            y2 = min(st.session_state.photo.shape[0], y + h + padding)
+                            x1 = max(0, x - padding)
+                            x2 = min(st.session_state.photo.shape[1], x + w + padding)
+                            
+                            face_crop = st.session_state.photo[y1:y2, x1:x2]
+                            face_img = Image.fromarray(face_crop)
+                            
+                            # Resize for display
+                            face_img.thumbnail((150, 150), Image.LANCZOS)
+                            st.image(face_img, caption=f"Face #{face['id']}", use_container_width=False)
+                        except:
+                            st.warning("Could not load face preview")
+                        
+                        # Delete button
+                        if st.button("🗑️ Delete This Face", key=f"del_{face['id']}", use_container_width=True):
+                            # Remove face from list
+                            st.session_state.faces = [f for f in st.session_state.faces if f['id'] != face['id']]
+                            st.success(f"Deleted Face #{face['id']}")
+                            st.rerun()
+                        
+                        st.markdown("---")
+                        
                         search = st.text_input(
-                            "Search",
+                            "Search Student",
                             key=f"s_{face['id']}",
-                            placeholder="Name, Roll..."
+                            placeholder="Name, Roll, Admission..."
                         )
                         
                         filtered = search_roster(st.session_state.roster, search)
@@ -609,7 +673,7 @@ client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
                                 options.append((disp, idx))
                             
                             selected = st.selectbox(
-                                "Student",
+                                "Select Student",
                                 options=options,
                                 format_func=lambda x: x[0],
                                 key=f"sel_{face['id']}"
@@ -627,27 +691,52 @@ client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
                                 
                                 st.success("✅ Assigned & Learned!")
                                 st.rerun()
+                        else:
+                            st.info("No students found. Try different search terms.")
                 
                 if len(unassigned) > 3:
-                    st.info(f"📋 {len(unassigned) - 3} more faces to assign...")
+                    st.info(f"📋 {len(unassigned) - 3} more faces to assign. Assign these first to see more.")
             else:
-                st.success("✅ All assigned!")
+                st.success("✅ All faces assigned!")
             
             st.markdown("---")
             
             if st.session_state.assignments:
                 st.markdown(f"### 🟢 Assigned ({len(st.session_state.assignments)})")
                 
-                for face_id, idx in list(st.session_state.assignments.items())[:5]:
+                for face_id, idx in list(st.session_state.assignments.items())[:10]:
                     student = st.session_state.roster.iloc[idx]
-                    col_a, col_b = st.columns([4, 1])
                     
-                    with col_a:
-                        st.text(f"#{face_id}: {student['Name']}")
-                    with col_b:
-                        if st.button("❌", key=f"rm_{face_id}"):
-                            del st.session_state.assignments[face_id]
-                            st.rerun()
+                    # Find the face to show thumbnail
+                    face = next((f for f in st.session_state.faces if f['id'] == face_id), None)
+                    
+                    with st.container():
+                        col_img, col_info = st.columns([1, 3])
+                        
+                        with col_img:
+                            if face:
+                                try:
+                                    x, y, w, h = face['x'], face['y'], face['w'], face['h']
+                                    face_crop = st.session_state.photo[y:y+h, x:x+w]
+                                    face_img = Image.fromarray(face_crop)
+                                    face_img.thumbnail((60, 60), Image.LANCZOS)
+                                    st.image(face_img, use_container_width=True)
+                                except:
+                                    st.write(f"#{face_id}")
+                            else:
+                                st.write(f"#{face_id}")
+                        
+                        with col_info:
+                            st.text(f"{student['Name']}")
+                            st.caption(f"Section: {student['Section']} | Roll: {student['Roll_No']}")
+                            if st.button("❌ Remove", key=f"rm_{face_id}"):
+                                del st.session_state.assignments[face_id]
+                                st.rerun()
+                        
+                        st.markdown("---")
+                
+                if len(st.session_state.assignments) > 10:
+                    st.caption(f"+ {len(st.session_state.assignments) - 10} more assigned")
     
     # Save section
     if st.session_state.roster is not None and st.session_state.assignments:
