@@ -292,6 +292,12 @@ def main():
                     st.rerun()
 
     # ---------------------------
+    # Scan-ready banner (visible regardless of active tab)
+    # ---------------------------
+    if st.session_state.scan_done and st.session_state.scan_results:
+        st.info("✅ Scan complete — switch to the **📸 Take Attendance** tab to review and save.")
+
+    # ---------------------------
     # Main tabs
     # ---------------------------
     tab1, tab2 = st.tabs(["📸 Take Attendance", "🖨️ Print QR Codes"])
