@@ -3,13 +3,10 @@ import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 import io
-import json
+import re
 import math
 import qrcode
 from pyzbar import pyzbar
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 # ---------------------------
 # Page configuration & styles
@@ -49,138 +46,24 @@ if 'photo_bytes' not in st.session_state:
     st.session_state.photo_bytes = None
 if 'detected_codes' not in st.session_state:
     st.session_state.detected_codes = []    # raw decoded strings from photo
-if 'sheets_connected' not in st.session_state:
-    st.session_state.sheets_connected = False
-if 'spreadsheet_id' not in st.session_state:
-    st.session_state.spreadsheet_id = None
-if 'show_master' not in st.session_state:
-    st.session_state.show_master = False
+if 'daily_csv' not in st.session_state:
+    st.session_state.daily_csv = None       # bytes of last saved daily CSV
+if 'daily_csv_date' not in st.session_state:
+    st.session_state.daily_csv_date = None  # date string for filename
 
 # ---------------------------
-# Google Sheets helpers
+# Roster helpers
 # ---------------------------
-def connect_to_sheets(credentials_dict, spreadsheet_id):
-    try:
-        credentials = service_account.Credentials.from_service_account_info(
-            credentials_dict,
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-        service = build('sheets', 'v4', credentials=credentials)
-        st.session_state.sheets_service = service
-        st.session_state.spreadsheet_id = spreadsheet_id
-        st.session_state.sheets_connected = True
-        return True
-    except Exception as e:
-        st.error(f"Connection failed: {str(e)}")
-        return False
-
-def read_sheet(sheet_name):
-    try:
-        service = st.session_state.sheets_service
-        spreadsheet_id = st.session_state.spreadsheet_id
-        result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=f"{sheet_name}!A:Z"
-        ).execute()
-        values = result.get('values', [])
-        if not values:
-            return None
-        df = pd.DataFrame(values[1:], columns=values[0])
-        return df
-    except HttpError as e:
-        if hasattr(e, "resp") and getattr(e.resp, "status", None) == 404:
-            return None
-        st.error(f"Error reading sheet: {str(e)}")
-        return None
-    except Exception as e:
-        st.error(f"Error reading sheet: {str(e)}")
-        return None
-
-def create_sheet_if_not_exists(sheet_name):
-    try:
-        service = st.session_state.sheets_service
-        spreadsheet_id = st.session_state.spreadsheet_id
-        spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-        existing = [s['properties']['title'] for s in spreadsheet.get('sheets', [])]
-        if sheet_name not in existing:
-            body = {'requests': [{'addSheet': {'properties': {'title': sheet_name}}}]}
-            service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
-        return True
-    except Exception as e:
-        st.error(f"Error creating sheet: {str(e)}")
-        return False
-
-def write_sheet(sheet_name, df):
-    try:
-        service = st.session_state.sheets_service
-        spreadsheet_id = st.session_state.spreadsheet_id
-        create_sheet_if_not_exists(sheet_name)
-        values = [df.columns.tolist()] + df.astype(str).values.tolist()
-        body = {'values': values}
-        try:
-            service.spreadsheets().values().clear(
-                spreadsheetId=spreadsheet_id,
-                range=f"{sheet_name}!A:Z"
-            ).execute()
-        except Exception:
-            pass
-        service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{sheet_name}!A1",
-            valueInputOption='USER_ENTERED',
-            body=body
-        ).execute()
-        return True
-    except Exception as e:
-        st.error(f"Error writing sheet: {str(e)}")
-        return False
-
-def init_master_attendance(roster):
-    df = roster.copy()
-    df['Total_Present'] = '0'
-    df['Total_Absent'] = '0'
-    df['Attendance_%'] = '0'
-    return df
-
-def update_master_attendance(roster, results, date_str):
-    """Update attendance sheet. results = {admission_no: 'P'/'A'}"""
-    master = read_sheet("Attendance")
-    if master is None or master.empty:
-        master = init_master_attendance(roster)
-    if 'Admission_No' not in master.columns:
-        master = init_master_attendance(roster)
-    if date_str not in master.columns:
-        master[date_str] = ''
-
-    for idx, row in roster.iterrows():
-        admission_no = row['Admission_No']
-        status = results.get(admission_no, 'A')
-        is_present = (status == 'P')
-        mask = master['Admission_No'] == admission_no
-        if mask.any():
-            m_idx = master[mask].index[0]
-            if master.loc[m_idx, date_str] not in ['P', 'A', 'p', 'a']:
-                master.loc[m_idx, date_str] = status
-                tp_raw = str(master.loc[m_idx, 'Total_Present']).split('.')[0]
-                ta_raw = str(master.loc[m_idx, 'Total_Absent']).split('.')[0]
-                tp = int(tp_raw) if tp_raw.isdigit() else 0
-                ta = int(ta_raw) if ta_raw.isdigit() else 0
-                tp += 1 if is_present else 0
-                ta += 0 if is_present else 1
-                master.loc[m_idx, 'Total_Present'] = str(tp)
-                master.loc[m_idx, 'Total_Absent'] = str(ta)
-                total_days = tp + ta
-                master.loc[m_idx, 'Attendance_%'] = str(round((tp / total_days) * 100, 2) if total_days else 0.0)
-        else:
-            new_row = row.copy()
-            new_row['Total_Present'] = '1' if is_present else '0'
-            new_row['Total_Absent'] = '0' if is_present else '1'
-            new_row['Attendance_%'] = '100' if is_present else '0'
-            new_row[date_str] = status
-            master = pd.concat([master, pd.DataFrame([new_row])], ignore_index=True)
-
-    write_sheet("Attendance", master)
-    return master
+def load_roster_from_public_sheet(url_or_id: str) -> pd.DataFrame:
+    """Fetch roster from a public Google Sheet using its CSV export URL.
+    Requires the sheet to be shared as 'Anyone with the link can view'.
+    No credentials or API keys needed.
+    """
+    match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url_or_id)
+    sheet_id = match.group(1) if match else url_or_id.strip()
+    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+    df = pd.read_csv(export_url, dtype=str).fillna("")
+    return df.sort_values('Admission_No').reset_index(drop=True)
 
 def search_roster(roster, query):
     if not query:
@@ -198,6 +81,21 @@ def search_roster(roster, query):
         roster[roll_c].str.lower().str.contains(q, regex=False)
     )
     return roster[mask]
+
+def build_daily_csv(roster: pd.DataFrame, results: dict, date_str: str) -> bytes:
+    """Build a minimal daily attendance CSV sorted by Admission_No."""
+    rows = []
+    for _, row in roster.sort_values('Admission_No').iterrows():
+        adm = str(row['Admission_No'])
+        rows.append({
+            'Admission_No': adm,
+            'Name': row['Name'],
+            'Roll_No': row.get('Roll_No', ''),
+            'Section': row.get('Section', ''),
+            'Status': results.get(adm, 'A'),
+        })
+    df = pd.DataFrame(rows)
+    return df.to_csv(index=False).encode('utf-8')
 
 # ---------------------------
 # QR code functions
@@ -223,7 +121,6 @@ def generate_qr_image(admission_no: str, name: str) -> Image.Image:
         font = ImageFont.load_default()
         font_small = font
 
-    # Truncate long names
     display_name = name if len(name) <= 20 else name[:18] + ".."
     draw.text((4, qr_h + 4), display_name, fill='black', font=font)
     draw.text((4, qr_h + 20), admission_no, fill='#555555', font=font_small)
@@ -290,75 +187,24 @@ def match_qr_to_roster(detected_codes: list, roster: pd.DataFrame) -> dict:
 def main():
     st.title("📱 QR Bulk Attendance System")
 
-    # Setup instructions
-    with st.expander("⚙️ HOW IT WORKS (First Time Setup)", expanded=not st.session_state.sheets_connected):
+    with st.expander("⚙️ HOW IT WORKS (First Time Setup)", expanded=st.session_state.roster is None):
         st.markdown("""
         ### One-Time Setup
-        1. Connect your **Google Sheet** below (service account credentials + spreadsheet ID)
-        2. Upload your **roster CSV** — columns: `Admission_No, Name, Section, Roll_No`
-        3. Go to **🖨️ Print QR Codes** tab → download the QR sheet → print & cut
-        4. Give each student their QR card — they keep it for the whole year
+        1. Load your **roster** — paste your public Google Sheet URL **or** upload a CSV
+           - CSV columns required: `Admission_No, Name, Section, Roll_No`
+           - For Google Sheet: share it as *"Anyone with the link can view"*
+        2. Go to **🖨️ Print QR Codes** tab → download the QR sheet → print & cut
+        3. Give each student their QR card — they keep it for the whole year
 
         ### Daily Attendance (takes ~10 seconds)
-        1. Upload today's roster (or load from Sheets)
-        2. Students hold up their QR cards facing your phone camera
-        3. Take **one group photo**
-        4. Upload it → click **Scan QR Codes**
-        5. Review results → Save to Google Sheets
+        1. Students hold up their QR cards facing your phone camera
+        2. Take **one group photo**
+        3. Upload it → click **Scan QR Codes**
+        4. Review results → **Save Attendance** → download the daily CSV
+        5. Copy the **Status** column into your master Excel sheet under today's date
         """)
 
     st.markdown("---")
-
-    # ---------------------------
-    # Google Sheets connection
-    # ---------------------------
-    if not st.session_state.sheets_connected:
-        st.subheader("🔗 Connect to Google Sheets")
-        auto_connected = False
-        try:
-            if "gcp_service_account" in st.secrets and "spreadsheet_id" in st.secrets:
-                with st.spinner("Connecting..."):
-                    if connect_to_sheets(dict(st.secrets["gcp_service_account"]), st.secrets["spreadsheet_id"]):
-                        st.success("✅ Connected to Google Sheets!")
-                        auto_connected = True
-                        roster = read_sheet("Roster")
-                        if roster is not None and not roster.empty:
-                            st.session_state.roster = roster
-                            st.success(f"✅ Loaded roster: {len(roster)} students")
-        except Exception as e:
-            st.error(f"Auto connect failed: {e}")
-
-        if not auto_connected:
-            creds_method = st.radio("Credentials method", ["Upload JSON", "Paste JSON"], horizontal=True)
-            credentials_dict = None
-            if creds_method == "Upload JSON":
-                cred_file = st.file_uploader("Upload service account JSON", type=["json"])
-                if cred_file:
-                    try:
-                        credentials_dict = json.load(cred_file)
-                    except Exception as e:
-                        st.error(f"Invalid JSON: {e}")
-            else:
-                json_text = st.text_area("Paste service account JSON here")
-                if json_text.strip():
-                    try:
-                        credentials_dict = json.loads(json_text)
-                    except Exception as e:
-                        st.error(f"Invalid JSON: {e}")
-
-            spreadsheet_id = st.text_input("Spreadsheet ID", placeholder="1AbC... (from the Sheet URL)")
-            if st.button("Connect"):
-                if not credentials_dict or not spreadsheet_id:
-                    st.error("Provide both credentials and Spreadsheet ID")
-                else:
-                    if connect_to_sheets(credentials_dict, spreadsheet_id):
-                        roster = read_sheet("Roster")
-                        if roster is not None and not roster.empty:
-                            st.session_state.roster = roster
-                        st.rerun()
-            st.stop()
-
-    st.success("🔗 Connected to Google Sheets")
 
     # ---------------------------
     # Sidebar
@@ -369,14 +215,32 @@ def main():
         st.markdown("---")
 
         st.subheader("👥 Roster")
-        if st.button("📥 Load Roster from Sheets", use_container_width=True):
-            roster = read_sheet("Roster")
-            if roster is not None and not roster.empty:
-                st.session_state.roster = roster
-                st.success(f"✅ Loaded {len(roster)} students")
-            else:
-                st.info("No roster found. Upload CSV below.")
 
+        # Option A: public Google Sheet URL
+        sheet_url = st.text_input(
+            "Public Google Sheet URL",
+            placeholder="https://docs.google.com/spreadsheets/d/...",
+            help="Sheet must be shared as 'Anyone with the link can view'. No credentials needed."
+        )
+        if st.button("Load from Google Sheet", use_container_width=True):
+            if not sheet_url.strip():
+                st.error("Paste your Google Sheet URL above.")
+            else:
+                try:
+                    with st.spinner("Fetching roster..."):
+                        df = load_roster_from_public_sheet(sheet_url.strip())
+                    required = {"Admission_No", "Name", "Section", "Roll_No"}
+                    if not required.issubset(set(df.columns)):
+                        st.error(f"Sheet must have columns: {', '.join(required)}")
+                    else:
+                        st.session_state.roster = df
+                        st.success(f"✅ Loaded {len(df)} students")
+                except Exception as e:
+                    st.error(f"Failed to load sheet: {e}")
+
+        st.markdown("— or —")
+
+        # Option B: CSV upload
         roster_file = st.file_uploader(
             "Upload Roster CSV", type=['csv'],
             help="Columns: Admission_No, Name, Section, Roll_No"
@@ -384,13 +248,13 @@ def main():
         if roster_file:
             try:
                 df = pd.read_csv(roster_file, dtype=str).fillna("")
+                df = df.sort_values('Admission_No').reset_index(drop=True)
                 required = {"Admission_No", "Name", "Section", "Roll_No"}
                 if not required.issubset(set(df.columns)):
                     st.error(f"❌ CSV must have: {', '.join(required)}")
                 else:
                     st.session_state.roster = df
-                    if write_sheet("Roster", df):
-                        st.success(f"✅ Roster saved: {len(df)} students")
+                    st.success(f"✅ Roster loaded: {len(df)} students")
             except Exception as e:
                 st.error(f"Error: {str(e)}")
 
@@ -409,6 +273,7 @@ def main():
             st.session_state.scan_done = False
             st.session_state.scan_results = {}
             st.session_state.detected_codes = []
+            st.session_state.daily_csv = None
             st.success("✅ Photo loaded")
 
         if st.session_state.photo_bytes:
@@ -425,11 +290,6 @@ def main():
                     present = sum(1 for v in results.values() if v == 'P')
                     st.success(f"✅ Found {len(codes)} QR codes → {present} students present")
                     st.rerun()
-
-        st.markdown("---")
-        if st.button("📊 View Master Sheet", use_container_width=True):
-            st.session_state.show_master = not st.session_state.show_master
-            st.rerun()
 
     # ---------------------------
     # Main tabs
@@ -476,7 +336,7 @@ def main():
                 rows_data = [
                     {"Admission_No": r['Admission_No'], "Name": r['Name'],
                      "Section": r['Section'], "Status": results.get(str(r['Admission_No']), 'A')}
-                    for _, r in roster_df.iterrows()
+                    for _, r in roster_df.sort_values('Admission_No').iterrows()
                 ]
                 grouped = [rows_data[i:i+cols_per_row] for i in range(0, len(rows_data), cols_per_row)]
 
@@ -494,17 +354,33 @@ def main():
                             )
 
                 save_btn = st.form_submit_button(
-                    "✅ SAVE TO GOOGLE SHEETS", use_container_width=True, type="primary"
+                    "✅ SAVE ATTENDANCE", use_container_width=True, type="primary"
                 )
 
             if save_btn:
-                with st.spinner("Saving..."):
-                    today = datetime.now().strftime('%Y-%m-%d')
-                    update_master_attendance(roster_df, updated, today)
-                    final_present = sum(1 for v in updated.values() if v == 'P')
-                st.success(f"✅ Saved for {today}! {final_present} present, {total - final_present} absent.")
-                st.balloons()
+                today = datetime.now().strftime('%Y-%m-%d')
+                csv_bytes = build_daily_csv(roster_df, updated, today)
+                st.session_state.daily_csv = csv_bytes
+                st.session_state.daily_csv_date = today
                 st.session_state.scan_results = updated
+                final_present = sum(1 for v in updated.values() if v == 'P')
+                st.success(f"✅ Attendance saved for {today} — {final_present} present, {total - final_present} absent.")
+                st.balloons()
+
+            # Show download button if CSV is ready (persists across rerenders)
+            if st.session_state.daily_csv:
+                st.download_button(
+                    label="📥 Download Today's Attendance CSV",
+                    data=st.session_state.daily_csv,
+                    file_name=f"attendance_{st.session_state.daily_csv_date}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    type="primary"
+                )
+                st.caption(
+                    "Paste the **Status** column into your master Excel sheet under today's date. "
+                    "Students are sorted by Admission_No — consistent every session."
+                )
 
     # ---- TAB 2: PRINT QR CODES ----
     with tab2:
@@ -565,40 +441,9 @@ def main():
                         qr_img = generate_qr_image(str(row['Admission_No']), str(row['Name']))
                         st.image(qr_img, use_container_width=True)
 
-    # ---------------------------
-    # Master attendance view
-    # ---------------------------
-    if st.session_state.get('show_master'):
-        st.markdown("---")
-        st.subheader("📊 Master Attendance Sheet")
-        master = read_sheet("Attendance")
-        if master is not None and not master.empty:
-            st.dataframe(master, use_container_width=True, height=400)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "📥 Download CSV",
-                    master.to_csv(index=False),
-                    f"attendance_{datetime.now().strftime('%Y%m%d')}.csv",
-                    use_container_width=True
-                )
-            with c2:
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    master.to_excel(writer, index=False)
-                output.seek(0)
-                st.download_button(
-                    "📥 Download Excel",
-                    output,
-                    f"attendance_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    use_container_width=True
-                )
-        else:
-            st.info("No attendance data yet.")
-
     st.markdown("---")
     st.markdown(
-        "<center>📱 QR Attendance System | No AI · No API costs · Works offline · Data in Google Sheets ☁️</center>",
+        "<center>📱 QR Attendance System | No API keys · No cloud setup · Download CSV daily</center>",
         unsafe_allow_html=True
     )
 
