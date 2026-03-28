@@ -65,7 +65,7 @@ def load_roster_from_public_sheet(url_or_id: str) -> pd.DataFrame:
     sheet_id = match.group(1) if match else url_or_id.strip()
     export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
     df = pd.read_csv(export_url, dtype=str).fillna("")
-    return df.sort_values('Admission_No').reset_index(drop=True)
+    return df.reset_index(drop=True)
 
 def search_roster(roster, query):
     if not query:
@@ -85,9 +85,9 @@ def search_roster(roster, query):
     return roster[mask]
 
 def build_daily_csv(roster: pd.DataFrame, results: dict, date_str: str) -> bytes:
-    """Build a minimal daily attendance CSV sorted by Admission_No."""
+    """Build a minimal daily attendance CSV in the original roster order."""
     rows = []
-    for _, row in roster.sort_values('Admission_No').iterrows():
+    for _, row in roster.iterrows():
         adm = str(row['Admission_No'])
         rows.append({
             'Admission_No': adm,
@@ -250,7 +250,7 @@ def main():
         if roster_file:
             try:
                 df = pd.read_csv(roster_file, dtype=str).fillna("")
-                df = df.sort_values('Admission_No').reset_index(drop=True)
+                df = df.reset_index(drop=True)
                 required = {"Admission_No", "Name", "Section", "Roll_No"}
                 if not required.issubset(set(df.columns)):
                     st.error(f"❌ CSV must have: {', '.join(required)}")
@@ -347,7 +347,7 @@ def main():
                 rows_data = [
                     {"Admission_No": r['Admission_No'], "Name": r['Name'],
                      "Section": r['Section'], "Status": results.get(str(r['Admission_No']), 'A')}
-                    for _, r in roster_df.sort_values('Admission_No').iterrows()
+                    for _, r in roster_df.iterrows()
                 ]
                 grouped = [rows_data[i:i+cols_per_row] for i in range(0, len(rows_data), cols_per_row)]
 
