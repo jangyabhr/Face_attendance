@@ -1,12 +1,12 @@
 
 import streamlit as st
 import pandas as pd
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from datetime import datetime
 import io
 import json
-import face_recognition  # New library for face recognition
+import base64
+import anthropic
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -15,7 +15,7 @@ from googleapiclient.errors import HttpError
 # Page configuration & styles
 # ---------------------------
 st.set_page_config(
-    page_title="Face Tap Attendance System (Upgraded)",
+    page_title="Face Attendance (Claude Vision)",
     page_icon="✨",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -41,30 +41,27 @@ st.markdown("""
 # ---------------------------
 if 'roster' not in st.session_state:
     st.session_state.roster = None
-if 'faces' not in st.session_state:
-    st.session_state.faces = []
-if 'assignments' not in st.session_state:
-    st.session_state.assignments = {}
+if 'student_photos' not in st.session_state:
+    st.session_state.student_photos = {}   # admission_no -> {"name": str, "photo_b64": str}
+if 'claude_results' not in st.session_state:
+    st.session_state.claude_results = {}   # admission_no -> "P" | "A" | "?"
+if 'analysis_done' not in st.session_state:
+    st.session_state.analysis_done = False
 if 'photo' not in st.session_state:
-    st.session_state.photo = None
-if 'photo_name' not in st.session_state:
-    st.session_state.photo_name = None
-if 'face_memory' not in st.session_state:
-    st.session_state.face_memory = {}  # admission_no -> face_encoding
+    st.session_state.photo = None          # PIL Image
+if 'photo_bytes' not in st.session_state:
+    st.session_state.photo_bytes = None    # raw bytes for API
 if 'sheets_connected' not in st.session_state:
     st.session_state.sheets_connected = False
 if 'spreadsheet_id' not in st.session_state:
     st.session_state.spreadsheet_id = None
 if 'show_master' not in st.session_state:
     st.session_state.show_master = False
-if 'match_tolerance' not in st.session_state:
-    st.session_state.match_tolerance = 0.6  # Lower is stricter
 
 # ---------------------------
-# Google Sheets helpers (No changes needed here)
+# Google Sheets helpers
 # ---------------------------
 def connect_to_sheets(credentials_dict, spreadsheet_id):
-    """Connect to Google Sheets using service account JSON (dict) and Spreadsheet ID."""
     try:
         credentials = service_account.Credentials.from_service_account_info(
             credentials_dict,
@@ -80,7 +77,6 @@ def connect_to_sheets(credentials_dict, spreadsheet_id):
         return False
 
 def read_sheet(sheet_name):
-    """Read entire A:Z range from a sheet tab into a DataFrame (or None)."""
     try:
         service = st.session_state.sheets_service
         spreadsheet_id = st.session_state.spreadsheet_id
@@ -103,7 +99,6 @@ def read_sheet(sheet_name):
         return None
 
 def create_sheet_if_not_exists(sheet_name):
-    """Create a new sheet tab if it doesn't exist."""
     try:
         service = st.session_state.sheets_service
         spreadsheet_id = st.session_state.spreadsheet_id
@@ -112,22 +107,18 @@ def create_sheet_if_not_exists(sheet_name):
         if sheet_name not in existing:
             body = {'requests': [{'addSheet': {'properties': {'title': sheet_name}}}]}
             service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
-            return True
-        return False
+        return True
     except Exception as e:
         st.error(f"Error creating sheet: {str(e)}")
         return False
 
 def write_sheet(sheet_name, df):
-    """Write DataFrame to Google Sheet tab from A1 using USER_ENTERED so numbers are numbers."""
     try:
         service = st.session_state.sheets_service
         spreadsheet_id = st.session_state.spreadsheet_id
         create_sheet_if_not_exists(sheet_name)
-
         values = [df.columns.tolist()] + df.astype(str).values.tolist()
         body = {'values': values}
-
         try:
             service.spreadsheets().values().clear(
                 spreadsheetId=spreadsheet_id,
@@ -135,7 +126,6 @@ def write_sheet(sheet_name, df):
             ).execute()
         except Exception:
             pass
-
         service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=f"{sheet_name}!A1",
@@ -154,188 +144,49 @@ def init_master_attendance(roster):
     df['Attendance_%'] = '0'
     return df
 
-def update_master_attendance(roster, assignments, date_str):
+def update_master_attendance(roster, results, date_str):
+    """Update attendance sheet. results = {admission_no: "P"/"A"/"?"}"""
     master = read_sheet("Attendance")
     if master is None or master.empty:
         master = init_master_attendance(roster)
-
-    if 'Admission_No' not in master.columns and 'Admission_No' in roster.columns:
+    if 'Admission_No' not in master.columns:
         master = init_master_attendance(roster)
-
     if date_str not in master.columns:
         master[date_str] = ''
 
-    present_indices = set(assignments.values())
-
     for idx, row in roster.iterrows():
         admission_no = row['Admission_No']
+        status = results.get(admission_no, 'A')
+        if status == '?':
+            status = 'A'
+        is_present = (status == 'P')
         mask = master['Admission_No'] == admission_no
-
         if mask.any():
             m_idx = master[mask].index[0]
             if master.loc[m_idx, date_str] not in ['P', 'A', 'p', 'a']:
-                is_present = idx in present_indices
-                master.loc[m_idx, date_str] = 'P' if is_present else 'A'
-
-                tp_raw = str(master.loc[m_idx, 'Total_Present'])
-                ta_raw = str(master.loc[m_idx, 'Total_Absent'])
+                master.loc[m_idx, date_str] = status
+                tp_raw = str(master.loc[m_idx, 'Total_Present']).split('.')[0]
+                ta_raw = str(master.loc[m_idx, 'Total_Absent']).split('.')[0]
                 tp = int(tp_raw) if tp_raw.isdigit() else 0
                 ta = int(ta_raw) if ta_raw.isdigit() else 0
-
                 tp += 1 if is_present else 0
                 ta += 0 if is_present else 1
-
                 master.loc[m_idx, 'Total_Present'] = str(tp)
                 master.loc[m_idx, 'Total_Absent'] = str(ta)
                 total_days = tp + ta
                 master.loc[m_idx, 'Attendance_%'] = str(round((tp / total_days) * 100, 2) if total_days else 0.0)
         else:
-            is_present = idx in present_indices
             new_row = row.copy()
             new_row['Total_Present'] = '1' if is_present else '0'
             new_row['Total_Absent'] = '0' if is_present else '1'
             new_row['Attendance_%'] = '100' if is_present else '0'
-            new_row[date_str] = 'P' if is_present else 'A'
+            new_row[date_str] = status
             master = pd.concat([master, pd.DataFrame([new_row])], ignore_index=True)
 
     write_sheet("Attendance", master)
     return master
 
-def save_face_memory():
-    if not st.session_state.face_memory:
-        return
-    data = []
-    for admission_no, encoding in st.session_state.face_memory.items():
-        if encoding is None:
-            continue
-        encoding_str = ','.join(map(str, encoding.tolist()))
-        data.append({'Admission_No': admission_no, 'Encoding': encoding_str})
-    if data:
-        df = pd.DataFrame(data)
-        write_sheet("FaceMemory", df)
-
-def load_face_memory():
-    df = read_sheet("FaceMemory")
-    if df is None or df.empty:
-        return {}
-    memory = {}
-    try:
-        for _, row in df.iterrows():
-            admission_no = row.get('Admission_No', '')
-            encoding_str = row.get('Encoding', '')
-            if not admission_no or not encoding_str:
-                continue
-            encoding = np.array([float(x) for x in encoding_str.split(',')])
-            memory[admission_no] = encoding
-    except Exception as e:
-        st.warning(f"Error loading face memory: {str(e)}")
-        return {}
-    return memory
-
-# -------------------------------------------------
-# Face detection & matching (UPGRADED LOGIC)
-# -------------------------------------------------
-def get_face_encoding(image_array, face_location):
-    """Generate a 128-d face encoding for a given face location."""
-    try:
-        # The face_recognition library needs a list of locations.
-        encodings = face_recognition.face_encodings(image_array, [face_location])
-        if encodings:
-            return encodings[0]
-        return None
-    except Exception as e:
-        st.warning(f"Error creating face encoding: {str(e)}")
-        return None
-
-def match_face_to_saved(current_encoding, saved_encodings, tolerance=0.6):
-    """Find the best match for a face encoding from saved encodings."""
-    best_match = None
-    if current_encoding is None or not saved_encodings:
-        return None
-
-    try:
-        known_encodings = list(saved_encodings.values())
-        known_admissions = list(saved_encodings.keys())
-
-        # Get the distance of the current face to all known faces
-        distances = face_recognition.face_distance(known_encodings, current_encoding)
-
-        if len(distances) > 0:
-            best_match_index = np.argmin(distances)
-            # If the best match is within the tolerance, we have a match
-            if distances[best_match_index] <= tolerance:
-                best_match = known_admissions[best_match_index]
-    except Exception as e:
-        st.warning(f"Face matching error: {str(e)}")
-        return None
-    return best_match
-
-def auto_assign_faces(faces, image_array, roster, saved_encodings, tolerance=0.6):
-    """Auto-assign faces by matching encodings with saved face memory."""
-    assignments = {}
-    for face in faces:
-        # Convert face dict to the (top, right, bottom, left) tuple format
-        top, left, h, w = face['y'], face['x'], face['h'], face['w']
-        face_location = (top, left + w, top + h, left)
-
-        encoding = get_face_encoding(image_array, face_location)
-        if encoding is not None:
-            matched_admission = match_face_to_saved(encoding, saved_encodings, tolerance=tolerance)
-            if matched_admission:
-                mask = roster['Admission_No'] == matched_admission
-                if mask.any():
-                    roster_idx = roster[mask].index[0]
-                    assignments[face['id']] = roster_idx
-    return assignments
-
-def detect_faces(image_array):
-    """Detect faces using face_recognition library (more accurate)."""
-    # This returns a list of tuples (top, right, bottom, left)
-    face_locations = face_recognition.face_locations(image_array)
-
-    face_list = []
-    for i, (top, right, bottom, left) in enumerate(face_locations, start=1):
-        # Convert back to x, y, w, h for consistency with the rest of the app
-        face_list.append({'id': i, 'x': int(left), 'y': int(top), 'w': int(right - left), 'h': int(bottom - top)})
-    return face_list
-
-def draw_faces_on_image(image, faces, assignments, roster):
-    """Draw rectangles and labels on the class photo."""
-    img_draw = image.copy()
-    draw = ImageDraw.Draw(img_draw)
-    try:
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-    except Exception:
-        font_small = ImageFont.load_default()
-
-    for face in faces:
-        face_id = face['id']
-        x, y, w, h = face['x'], face['y'], face['w'], face['h']
-        if face_id in assignments:
-            color = "#4CAF50"
-            idx = assignments[face_id]
-            if roster is not None and idx < len(roster):
-                name = roster.iloc[idx]['Name']
-                label = f"#{face_id}: {name}"
-            else:
-                label = f"#{face_id} ✓"
-            width = 4
-        else:
-            color = "#FF9800"
-            label = f"#{face_id}"
-            width = 3
-
-        draw.rectangle([x, y, x+w, y+h], outline=color, width=width)
-        try:
-            bbox = draw.textbbox((x, y-25), label, font=font_small)
-            draw.rectangle([bbox[0]-5, bbox[1]-2, bbox[2]+5, bbox[3]+2], fill=color)
-        except Exception:
-            pass
-        draw.text((x, max(0, y-25)), label, fill="white", font=font_small)
-    return img_draw
-
 def search_roster(roster, query):
-    """Filter roster by Name / Admission_No / Section / Roll_No (contains)."""
     if not query:
         return roster
     q = query.lower()
@@ -353,18 +204,191 @@ def search_roster(roster, query):
     return roster[mask]
 
 # ---------------------------
+# Photo helpers
+# ---------------------------
+def compress_photo_for_storage(image_bytes: bytes, size=(150, 150)) -> str:
+    """Thumbnail to 150x150 JPEG, return base64 string for Google Sheets storage."""
+    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    img.thumbnail(size, Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
+
+def compress_photo_for_api(image_bytes: bytes, max_size=(512, 512)) -> str:
+    """Resize to max 512x512 JPEG, return base64 string for Claude API."""
+    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    img.thumbnail(max_size, Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
+
+# ---------------------------
+# Student photo enrollment
+# ---------------------------
+def enroll_student_photo(admission_no: str, name: str, photo_bytes: bytes) -> bool:
+    """Save a student reference photo to the StudentPhotos sheet (upsert)."""
+    try:
+        photo_b64 = compress_photo_for_storage(photo_bytes)
+        df = read_sheet("StudentPhotos")
+        new_row = pd.DataFrame([{'Admission_No': admission_no, 'Name': name, 'PhotoData': photo_b64}])
+        if df is None or df.empty:
+            df = new_row
+        else:
+            mask = df['Admission_No'] == admission_no
+            if mask.any():
+                df.loc[mask, 'Name'] = name
+                df.loc[mask, 'PhotoData'] = photo_b64
+            else:
+                df = pd.concat([df, new_row], ignore_index=True)
+        success = write_sheet("StudentPhotos", df)
+        if success:
+            st.session_state.student_photos[admission_no] = {"name": name, "photo_b64": photo_b64}
+        return success
+    except Exception as e:
+        st.error(f"Enrollment failed: {str(e)}")
+        return False
+
+def load_student_photos() -> dict:
+    """Load all student reference photos from the StudentPhotos sheet."""
+    df = read_sheet("StudentPhotos")
+    if df is None or df.empty:
+        return {}
+    photos = {}
+    for _, row in df.iterrows():
+        adm = str(row.get('Admission_No', '')).strip()
+        photo_b64 = str(row.get('PhotoData', '')).strip()
+        name = str(row.get('Name', '')).strip()
+        if adm and photo_b64:
+            photos[adm] = {"name": name, "photo_b64": photo_b64}
+    return photos
+
+# ---------------------------
+# Claude Vision identification
+# ---------------------------
+def parse_claude_response(response_text: str, enrolled_admission_nos: list) -> dict:
+    """Parse Claude's JSON response into {admission_no: 'P'/'A'/'?'}."""
+    results = {adm: 'A' for adm in enrolled_admission_nos}
+    try:
+        # Extract JSON from response (Claude may include surrounding text)
+        text = response_text.strip()
+        start = text.find('{')
+        end = text.rfind('}') + 1
+        if start >= 0 and end > start:
+            data = json.loads(text[start:end])
+            for adm in data.get('present', []):
+                if adm in results:
+                    results[adm] = 'P'
+            for adm in data.get('uncertain', []):
+                if adm in results:
+                    results[adm] = '?'
+    except Exception:
+        pass
+    return results
+
+def identify_attendance_with_claude(
+    class_photo_bytes: bytes,
+    enrolled_students: list,
+    api_key: str,
+    model: str = "claude-haiku-4-5-20251001",
+    batch_size: int = 10
+) -> dict:
+    """
+    Identify present students using Claude Vision API.
+    enrolled_students: [{"admission_no": str, "name": str, "photo_b64": str}]
+    Returns {admission_no: "P"/"A"/"?"}
+    """
+    client = anthropic.Anthropic(api_key=api_key)
+    class_photo_b64 = compress_photo_for_api(class_photo_bytes)
+    all_results = {}
+
+    batches = [enrolled_students[i:i+batch_size] for i in range(0, len(enrolled_students), batch_size)]
+    progress = st.progress(0, text="Asking Claude to identify students...")
+
+    for batch_num, batch in enumerate(batches):
+        progress.progress(
+            int((batch_num / len(batches)) * 100),
+            text=f"Processing batch {batch_num + 1}/{len(batches)}..."
+        )
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    "You are an attendance tracking assistant. "
+                    "Below are reference photos of students, followed by a classroom photo. "
+                    "Compare each student's reference photo to the faces visible in the classroom photo. "
+                    "Determine which students are physically present in the classroom photo.\n\n"
+                    "REFERENCE PHOTOS:"
+                )
+            }
+        ]
+
+        for student in batch:
+            content.append({
+                "type": "text",
+                "text": f"Student ID: {student['admission_no']} — {student['name']}"
+            })
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": student['photo_b64']
+                }
+            })
+
+        content.append({
+            "type": "text",
+            "text": "CLASSROOM PHOTO (identify which students above are present in this photo):"
+        })
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": class_photo_b64
+            }
+        })
+        content.append({
+            "type": "text",
+            "text": (
+                'Respond with ONLY a valid JSON object in this exact format (no extra text):\n'
+                '{"present": ["ADM001", "ADM003"], "absent": ["ADM002"], "uncertain": ["ADM004"]}\n'
+                'Every student ID from the reference photos must appear in exactly one list.'
+            )
+        })
+
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": content}]
+            )
+            response_text = response.content[0].text
+            batch_admission_nos = [s['admission_no'] for s in batch]
+            batch_results = parse_claude_response(response_text, batch_admission_nos)
+            all_results.update(batch_results)
+        except Exception as e:
+            st.warning(f"Batch {batch_num + 1} error: {str(e)}")
+            for student in batch:
+                all_results[student['admission_no']] = '?'
+
+    progress.progress(100, text="Done!")
+    return all_results
+
+# ---------------------------
 # Main App
 # ---------------------------
 def main():
-    st.title("✨ Face Attendance (Upgraded Engine)")
+    st.title("✨ Face Attendance (Claude Vision)")
 
     with st.expander("⚙️ SETUP INSTRUCTIONS (First Time Only)", expanded=not st.session_state.sheets_connected):
         st.markdown("""
-        ### 📋 One-Time Setup
-        **Step 1:** Create a Google Sheet.
-        **Step 2:** Enable *Google Sheets API* & create a **Service Account** key.
-        **Step 3:** Share the Sheet with the **service account email** as *Editor*.
-        **Step 4:** Connect below (auto via `st.secrets` or manual upload/paste).
+        ### One-Time Setup
+        1. Create a Google Sheet and enable the **Google Sheets API**
+        2. Create a **Service Account** key (JSON)
+        3. Share the Sheet with the service account email as *Editor*
+        4. Get an **Anthropic API key** from console.anthropic.com
+        5. Add to Streamlit secrets: `ANTHROPIC_API_KEY`, `spreadsheet_id`, `gcp_service_account`
         """)
 
     st.markdown("---")
@@ -385,16 +409,16 @@ def main():
                         if roster is not None and not roster.empty:
                             st.session_state.roster = roster
                             st.success(f"✅ Loaded roster: {len(roster)} students")
-                        st.session_state.face_memory = load_face_memory()
-                        if st.session_state.face_memory:
-                            st.info(f"🧠 Loaded {len(st.session_state.face_memory)} saved faces")
+                        photos = load_student_photos()
+                        if photos:
+                            st.session_state.student_photos = photos
+                            st.info(f"📸 Loaded {len(photos)} enrolled student photos")
         except Exception as e:
             st.error(f"Auto connect failed: {e}")
 
         if not auto_connected:
             st.info("Provide credentials manually if secrets are not configured.")
-            creds_method = st.radio("How will you provide credentials?", ["Upload JSON", "Paste JSON"], horizontal=True)
-
+            creds_method = st.radio("Credentials method", ["Upload JSON", "Paste JSON"], horizontal=True)
             credentials_dict = None
             if creds_method == "Upload JSON":
                 cred_file = st.file_uploader("Upload service account JSON", type=["json"])
@@ -412,33 +436,53 @@ def main():
                         st.error(f"Invalid JSON: {e}")
 
             spreadsheet_id = st.text_input("Spreadsheet ID", placeholder="1AbC... (from the Sheet URL)")
-
             if st.button("Connect"):
                 if not credentials_dict or not spreadsheet_id:
                     st.error("Provide both credentials and Spreadsheet ID")
                 else:
                     if connect_to_sheets(credentials_dict, spreadsheet_id):
-                        st.success("✅ Connected to Google Sheets!")
+                        st.success("✅ Connected!")
                         roster = read_sheet("Roster")
                         if roster is not None and not roster.empty:
                             st.session_state.roster = roster
-                            st.success(f"✅ Loaded roster: {len(roster)} students")
-                        st.session_state.face_memory = load_face_memory()
-                        if st.session_state.face_memory:
-                            st.info(f"🧠 Loaded {len(st.session_state.face_memory)} saved faces")
+                        photos = load_student_photos()
+                        if photos:
+                            st.session_state.student_photos = photos
                         st.rerun()
             st.stop()
 
-    # Main UI (when connected)
     st.success("🔗 Connected to Google Sheets")
 
+    # ---------------------------
+    # Sidebar
+    # ---------------------------
     with st.sidebar:
-        st.header("⚙️ Daily Controls")
+        st.header("⚙️ Controls")
         st.metric("📅 Date", datetime.now().strftime('%b %d, %Y'))
         st.markdown("---")
 
+        # Anthropic API key
+        st.subheader("🤖 Claude API Key")
+        default_key = ""
+        try:
+            default_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            pass
+        api_key_input = st.text_input(
+            "Anthropic API Key",
+            value=default_key,
+            type="password",
+            placeholder="sk-ant-...",
+            help="From console.anthropic.com"
+        )
+        if api_key_input:
+            st.session_state.anthropic_key = api_key_input
+
+        st.markdown("---")
+
+        # Roster
         st.subheader("👥 Roster")
-        if st.button("📥 Load from Sheets", use_container_width=True):
+        if st.button("📥 Load Roster from Sheets", use_container_width=True):
             roster = read_sheet("Roster")
             if roster is not None and not roster.empty:
                 st.session_state.roster = roster
@@ -446,13 +490,17 @@ def main():
             else:
                 st.info("No roster found. Upload CSV below.")
 
-        roster_file = st.file_uploader("Or Upload New Roster CSV", type=['csv'], help="Columns: Admission_No, Name, Section, Roll_No")
+        roster_file = st.file_uploader(
+            "Upload Roster CSV",
+            type=['csv'],
+            help="Columns: Admission_No, Name, Section, Roll_No"
+        )
         if roster_file:
             try:
                 df = pd.read_csv(roster_file, dtype=str).fillna("")
                 required = {"Admission_No", "Name", "Section", "Roll_No"}
                 if not required.issubset(set(df.columns)):
-                    st.error(f"❌ Must have: {', '.join(required)}")
+                    st.error(f"❌ CSV must have: {', '.join(required)}")
                 else:
                     st.session_state.roster = df
                     if write_sheet("Roster", df):
@@ -465,202 +513,195 @@ def main():
 
         st.markdown("---")
 
-        st.subheader("📸 Today's Photo")
+        # Student enrollment
+        st.subheader("📸 Enroll Students")
+        enrolled_count = len(st.session_state.student_photos)
+        st.caption(f"{enrolled_count} students enrolled with reference photos")
+
+        if st.button("🔄 Reload Enrolled Photos", use_container_width=True):
+            photos = load_student_photos()
+            st.session_state.student_photos = photos
+            st.success(f"Loaded {len(photos)} photos")
+
+        if st.session_state.roster is not None:
+            roster_df = st.session_state.roster
+            student_options = [
+                f"{row['Name']} ({row['Admission_No']})"
+                for _, row in roster_df.iterrows()
+            ]
+            selected_student_label = st.selectbox("Select student to enroll", student_options)
+            enroll_photo = st.file_uploader(
+                "Upload reference photo",
+                type=['jpg', 'jpeg', 'png'],
+                key="enroll_photo"
+            )
+            if st.button("✅ Enroll Student", use_container_width=True):
+                if enroll_photo and selected_student_label:
+                    idx = student_options.index(selected_student_label)
+                    row = roster_df.iloc[idx]
+                    admission_no = row['Admission_No']
+                    name = row['Name']
+                    photo_bytes = enroll_photo.read()
+                    with st.spinner("Enrolling..."):
+                        if enroll_student_photo(admission_no, name, photo_bytes):
+                            st.success(f"✅ Enrolled {name}")
+                        else:
+                            st.error("Enrollment failed")
+                else:
+                    st.warning("Select a student and upload a photo")
+
+        st.markdown("---")
+
+        # Today's photo
+        st.subheader("📷 Today's Photo")
         photo_file = st.file_uploader("Upload classroom photo", type=['jpg', 'jpeg', 'png'])
         if photo_file:
-            image = Image.open(photo_file).convert('RGB')
-            st.session_state.photo = np.array(image)
-            st.session_state.photo_name = photo_file.name
+            photo_bytes = photo_file.read()
+            st.session_state.photo = Image.open(io.BytesIO(photo_bytes)).convert('RGB')
+            st.session_state.photo_bytes = photo_bytes
+            st.session_state.analysis_done = False
+            st.session_state.claude_results = {}
             st.success("✅ Photo loaded")
 
         st.markdown("---")
 
-        st.subheader("🔍 Detection & Matching")
-        st.session_state.match_tolerance = st.slider("Match Tolerance", 0.4, 0.7, st.session_state.match_tolerance, 0.01, help="Lower is stricter. Default is 0.6.")
-
-        if st.button("🔍 Detect & Auto-Assign", use_container_width=True):
-            if st.session_state.photo is None:
-                st.error("❌ Upload photo first")
-            elif st.session_state.roster is None:
-                st.error("❌ Load roster first")
-            else:
-                with st.spinner("Detecting faces..."):
-                    faces = detect_faces(st.session_state.photo)
-                    st.session_state.faces = faces
-                    st.session_state.assignments = st.session_state.assignments or {}
-
-                    if faces:
-                        st.success(f"✅ Found {len(faces)} faces")
-                        if st.session_state.face_memory:
-                            with st.spinner("🧠 Auto-assigning..."):
-                                auto = auto_assign_faces(
-                                    faces,
-                                    st.session_state.photo,
-                                    st.session_state.roster,
-                                    st.session_state.face_memory,
-                                    tolerance=st.session_state.match_tolerance
-                                )
-                                st.session_state.assignments.update(auto)
-                                if auto:
-                                    st.success(f"🎯 Auto-assigned {len(auto)} faces!")
-                        else:
-                            st.info("💡 First time: Teach system by assigning manually")
-                    else:
-                        st.warning("⚠️ No faces found")
-
-        st.markdown("---")
-
-        if st.button("🗑️ Clear Assignments", use_container_width=True):
-            st.session_state.assignments = {}
+        if st.button("📊 View Master Sheet", use_container_width=True):
+            st.session_state.show_master = not st.session_state.show_master
             st.rerun()
 
-        if st.button("📊 View Master Sheet", use_container_width=True):
-            st.session_state.show_master = True
-
-    col1, col2 = st.columns([2, 1])
+    # ---------------------------
+    # Main content
+    # ---------------------------
+    col1, col2 = st.columns([3, 2])
 
     with col1:
-        st.subheader("📷 Classroom View")
-        if st.session_state.photo is not None and st.session_state.faces:
-            img_pil = Image.fromarray(st.session_state.photo)
-            img_with_faces = draw_faces_on_image(
-                img_pil, st.session_state.faces, st.session_state.assignments, st.session_state.roster
-            )
-            st.image(img_with_faces, use_container_width=True)
-
-            assigned = len(st.session_state.assignments)
-            total = len(st.session_state.faces)
-            st.info(f"🟢 Assigned: {assigned} | 🟠 Pending: {total - assigned}")
-
-        elif st.session_state.photo is not None:
+        st.subheader("📷 Classroom Photo")
+        if st.session_state.photo is not None:
             st.image(st.session_state.photo, use_container_width=True)
         else:
-            st.info("👈 Upload photo to begin")
+            st.info("👈 Upload today's classroom photo in the sidebar")
 
     with col2:
-        st.subheader("👤 Assign Faces")
+        st.subheader("🤖 Claude Analysis")
 
-        if st.session_state.faces and st.session_state.roster is not None:
-            unassigned = [f for f in st.session_state.faces if f['id'] not in st.session_state.assignments]
+        if st.session_state.photo is None:
+            st.info("Upload a classroom photo first")
+        elif not st.session_state.student_photos:
+            st.warning("No enrolled students found. Enroll students with reference photos first.")
+        elif not st.session_state.get('anthropic_key'):
+            st.warning("Enter your Anthropic API key in the sidebar")
+        else:
+            enrolled_in_roster = []
+            if st.session_state.roster is not None:
+                for _, row in st.session_state.roster.iterrows():
+                    adm = row['Admission_No']
+                    if adm in st.session_state.student_photos:
+                        enrolled_in_roster.append({
+                            "admission_no": adm,
+                            "name": row['Name'],
+                            "photo_b64": st.session_state.student_photos[adm]['photo_b64']
+                        })
 
-            if unassigned:
-                st.markdown(f"### 🟠 Unassigned ({len(unassigned)})")
+            st.info(
+                f"📸 {len(enrolled_in_roster)} of {len(st.session_state.roster) if st.session_state.roster is not None else 0} "
+                f"students have reference photos"
+            )
 
-                for face in unassigned[:3]:
-                    with st.expander(f"Face #{face['id']}", expanded=True):
-                        try:
-                            x, y, w, h = face['x'], face['y'], face['w'], face['h']
-                            padding = 20
-                            y1, y2 = max(0, y - padding), min(st.session_state.photo.shape[0], y + h + padding)
-                            x1, x2 = max(0, x - padding), min(st.session_state.photo.shape[1], x + w + padding)
+            if st.button("🔍 Identify Attendance with Claude", use_container_width=True, type="primary"):
+                if not enrolled_in_roster:
+                    st.error("No students with reference photos found in the current roster")
+                else:
+                    with st.spinner("Sending to Claude Vision API..."):
+                        results = identify_attendance_with_claude(
+                            class_photo_bytes=st.session_state.photo_bytes,
+                            enrolled_students=enrolled_in_roster,
+                            api_key=st.session_state.anthropic_key
+                        )
+                    st.session_state.claude_results = results
+                    st.session_state.analysis_done = True
+                    st.rerun()
 
-                            face_crop = st.session_state.photo[y1:y2, x1:x2]
-                            face_img = Image.fromarray(face_crop)
-                            face_img.thumbnail((150, 150), Image.LANCZOS)
-                            st.image(face_img, caption=f"Face #{face['id']}", use_container_width=False)
-                        except Exception:
-                            st.warning("Could not load face preview")
-
-                        if st.button("🗑️ Delete This Face", key=f"del_{face['id']}", use_container_width=True):
-                            st.session_state.faces = [f for f in st.session_state.faces if f['id'] != face['id']]
-                            st.session_state.faces = [{**f, 'id': i + 1} for i, f in enumerate(st.session_state.faces)]
-                            st.session_state.assignments = {
-                                new_id: idx for old_id, idx in st.session_state.assignments.items()
-                                if (new_id := next((nf['id'] for nf in st.session_state.faces if st.session_state.faces[old_id-1]['x'] == nf['x']), None))
-                            }
-                            st.success(f"Deleted Face (and re-numbered)")
-                            st.rerun()
-
-                        st.markdown("---")
-
-                        search = st.text_input("Search Student", key=f"s_{face['id']}", placeholder="Name, Roll, Admission...")
-                        filtered = search_roster(st.session_state.roster, search) if search is not None else st.session_state.roster
-
-                        if len(filtered) > 0:
-                            options = [(f"{row['Name']} ({row['Section']}) - R:{row['Roll_No']}", idx) for idx, row in filtered.iterrows()]
-                            selected = st.selectbox("Select Student", options=options, format_func=lambda x: x[0], key=f"sel_{face['id']}")
-
-                            if st.button("✅ Assign", key=f"a_{face['id']}", use_container_width=True):
-                                idx = selected[1]
-                                admission_no = st.session_state.roster.iloc[idx]['Admission_No']
-                                st.session_state.assignments[face['id']] = idx
-
-                                top, left, h, w = face['y'], face['x'], face['h'], face['w']
-                                face_location = (top, left + w, top + h, left)
-                                encoding = get_face_encoding(st.session_state.photo, face_location)
-                                if encoding is not None:
-                                    st.session_state.face_memory[admission_no] = encoding
-
-                                st.success("✅ Assigned & Learned!")
-                                st.rerun()
-                        else:
-                            st.info("No students found.")
-                if len(unassigned) > 3:
-                    st.info(f"📋 {len(unassigned) - 3} more faces to assign.")
-            else:
-                st.success("✅ All faces assigned!")
-
-            st.markdown("---")
-
-            if st.session_state.assignments:
-                st.markdown(f"### 🟢 Assigned ({len(st.session_state.assignments)})")
-                for face_id, idx in list(st.session_state.assignments.items())[:10]:
-                    student = st.session_state.roster.iloc[idx]
-                    face = next((f for f in st.session_state.faces if f['id'] == face_id), None)
-                    with st.container():
-                        col_img, col_info = st.columns([1, 3])
-                        with col_img:
-                            if face:
-                                try:
-                                    x, y, w, h = face['x'], face['y'], face['w'], face['h']
-                                    face_crop = st.session_state.photo[y:y+h, x:x+w]
-                                    face_img = Image.fromarray(face_crop)
-                                    face_img.thumbnail((60, 60), Image.LANCZOS)
-                                    st.image(face_img, use_container_width=True)
-                                except Exception:
-                                    st.write(f"#{face_id}")
-                            else:
-                                st.write(f"#{face_id}")
-                        with col_info:
-                            st.text(f"{student['Name']}")
-                            st.caption(f"Section: {student['Section']} | Roll: {student['Roll_No']}")
-                            if st.button("❌ Remove", key=f"rm_{face_id}"):
-                                del st.session_state.assignments[face_id]
-                                st.rerun()
-                        st.markdown("---")
-                if len(st.session_state.assignments) > 10:
-                    st.caption(f"+ {len(st.session_state.assignments) - 10} more assigned")
-
-    # Save section
-    if st.session_state.roster is not None and st.session_state.assignments:
+    # ---------------------------
+    # Review & Save section
+    # ---------------------------
+    if st.session_state.analysis_done and st.session_state.claude_results and st.session_state.roster is not None:
         st.markdown("---")
-        st.subheader("💾 Save Attendance")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            present = len(set(st.session_state.assignments.values()))
-            total = len(st.session_state.roster)
-            st.metric("Present", f"{present}/{total}")
-        with col2:
-            pct = (present / total * 100) if total > 0 else 0
-            st.metric("Rate", f"{pct:.1f}%")
-        with col3:
-            learned = len(st.session_state.face_memory)
-            st.metric("Learned", learned)
+        st.subheader("✏️ Review & Correct Attendance")
+        st.caption("Claude's results are pre-filled. Correct any mistakes before saving.")
 
-        if st.button("✅ SAVE TO GOOGLE SHEETS", use_container_width=True, type="primary"):
-            with st.spinner("Saving..."):
+        results = dict(st.session_state.claude_results)
+        roster_df = st.session_state.roster
+
+        # Build editable table
+        review_data = []
+        for _, row in roster_df.iterrows():
+            adm = row['Admission_No']
+            current_status = results.get(adm, 'A')
+            has_photo = adm in st.session_state.student_photos
+            review_data.append({
+                "Admission_No": adm,
+                "Name": row['Name'],
+                "Section": row['Section'],
+                "Roll_No": row['Roll_No'],
+                "Status": current_status,
+                "Has Photo": "✅" if has_photo else "❌"
+            })
+
+        review_df = pd.DataFrame(review_data)
+
+        # Summary metrics
+        present_count = sum(1 for s in results.values() if s == 'P')
+        absent_count = sum(1 for s in results.values() if s == 'A')
+        uncertain_count = sum(1 for s in results.values() if s == '?')
+        total = len(roster_df)
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Present", present_count)
+        mc2.metric("Absent", absent_count)
+        mc3.metric("Uncertain (?)", uncertain_count)
+        mc4.metric("Rate", f"{present_count/total*100:.1f}%" if total else "0%")
+
+        # Editable status per student
+        st.markdown("**Adjust statuses if needed (P = Present, A = Absent):**")
+
+        with st.form("review_form"):
+            updated_results = {}
+            cols_per_row = 3
+            student_rows = [review_data[i:i+cols_per_row] for i in range(0, len(review_data), cols_per_row)]
+
+            for row_group in student_rows:
+                form_cols = st.columns(cols_per_row)
+                for fc, student in zip(form_cols, row_group):
+                    with fc:
+                        adm = student['Admission_No']
+                        key = f"status_{adm}"
+                        badge = "🟢" if student['Status'] == 'P' else ("🟡" if student['Status'] == '?' else "🔴")
+                        new_status = st.selectbox(
+                            f"{badge} {student['Name']}",
+                            options=['P', 'A', '?'],
+                            index=['P', 'A', '?'].index(student['Status']),
+                            key=key
+                        )
+                        updated_results[adm] = new_status
+
+            submitted = st.form_submit_button("✅ SAVE TO GOOGLE SHEETS", use_container_width=True, type="primary")
+
+        if submitted:
+            with st.spinner("Saving attendance..."):
                 today = datetime.now().strftime('%Y-%m-%d')
-                master = update_master_attendance(
-                    st.session_state.roster,
-                    st.session_state.assignments,
-                    today
-                )
-                save_face_memory()
-                st.success(f"✅ Saved for {today}!")
+                master = update_master_attendance(roster_df, updated_results, today)
+                present_final = sum(1 for s in updated_results.values() if s == 'P')
+                st.success(f"✅ Attendance saved for {today}! {present_final} present, {total - present_final} absent.")
                 st.balloons()
-                st.info(f"📊 {present} present, {total - present} absent")
+                st.session_state.claude_results = updated_results
 
-    # View master
+    elif st.session_state.roster is not None and not st.session_state.analysis_done:
+        st.markdown("---")
+        st.info("Upload a classroom photo and click 'Identify Attendance with Claude' to begin.")
+
+    # ---------------------------
+    # Master attendance view
+    # ---------------------------
     if st.session_state.get('show_master'):
         st.markdown("---")
         st.subheader("📊 Master Attendance Sheet")
@@ -670,21 +711,31 @@ def main():
             c1, c2 = st.columns(2)
             with c1:
                 csv = master.to_csv(index=False)
-                st.download_button("📥 CSV", csv, f"attendance_{datetime.now().strftime('%Y%m%d')}.csv", use_container_width=True)
+                st.download_button(
+                    "📥 Download CSV",
+                    csv,
+                    f"attendance_{datetime.now().strftime('%Y%m%d')}.csv",
+                    use_container_width=True
+                )
             with c2:
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     master.to_excel(writer, index=False)
                 output.seek(0)
-                st.download_button("📥 Excel", output, f"attendance_{datetime.now().strftime('%Y%m%d')}.xlsx", use_container_width=True)
+                st.download_button(
+                    "📥 Download Excel",
+                    output,
+                    f"attendance_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    use_container_width=True
+                )
         else:
-            st.info("No data yet")
-        if st.button("Close"):
-            st.session_state.show_master = False
-            st.rerun()
+            st.info("No attendance data yet.")
 
     st.markdown("---")
-    st.markdown("<center>📚 Face Attendance System | Data in Google Sheets ☁️</center>", unsafe_allow_html=True)
+    st.markdown(
+        "<center>📚 Face Attendance System (Claude Vision) | Data in Google Sheets ☁️</center>",
+        unsafe_allow_html=True
+    )
 
 if __name__ == "__main__":
     main()
