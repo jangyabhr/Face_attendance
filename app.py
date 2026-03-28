@@ -1,12 +1,12 @@
-
 import streamlit as st
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 import io
 import json
-import base64
-import anthropic
+import math
+import qrcode
+from pyzbar import pyzbar
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -15,8 +15,8 @@ from googleapiclient.errors import HttpError
 # Page configuration & styles
 # ---------------------------
 st.set_page_config(
-    page_title="Face Attendance (Claude Vision)",
-    page_icon="✨",
+    page_title="QR Attendance System",
+    page_icon="📱",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -41,16 +41,14 @@ st.markdown("""
 # ---------------------------
 if 'roster' not in st.session_state:
     st.session_state.roster = None
-if 'student_photos' not in st.session_state:
-    st.session_state.student_photos = {}   # admission_no -> {"name": str, "photo_b64": str}
-if 'claude_results' not in st.session_state:
-    st.session_state.claude_results = {}   # admission_no -> "P" | "A" | "?"
-if 'analysis_done' not in st.session_state:
-    st.session_state.analysis_done = False
-if 'photo' not in st.session_state:
-    st.session_state.photo = None          # PIL Image
+if 'scan_results' not in st.session_state:
+    st.session_state.scan_results = {}      # admission_no -> "P"/"A"
+if 'scan_done' not in st.session_state:
+    st.session_state.scan_done = False
 if 'photo_bytes' not in st.session_state:
-    st.session_state.photo_bytes = None    # raw bytes for API
+    st.session_state.photo_bytes = None
+if 'detected_codes' not in st.session_state:
+    st.session_state.detected_codes = []    # raw decoded strings from photo
 if 'sheets_connected' not in st.session_state:
     st.session_state.sheets_connected = False
 if 'spreadsheet_id' not in st.session_state:
@@ -145,7 +143,7 @@ def init_master_attendance(roster):
     return df
 
 def update_master_attendance(roster, results, date_str):
-    """Update attendance sheet. results = {admission_no: "P"/"A"/"?"}"""
+    """Update attendance sheet. results = {admission_no: 'P'/'A'}"""
     master = read_sheet("Attendance")
     if master is None or master.empty:
         master = init_master_attendance(roster)
@@ -157,8 +155,6 @@ def update_master_attendance(roster, results, date_str):
     for idx, row in roster.iterrows():
         admission_no = row['Admission_No']
         status = results.get(admission_no, 'A')
-        if status == '?':
-            status = 'A'
         is_present = (status == 'P')
         mask = master['Admission_No'] == admission_no
         if mask.any():
@@ -204,220 +200,135 @@ def search_roster(roster, query):
     return roster[mask]
 
 # ---------------------------
-# Photo helpers
+# QR code functions
 # ---------------------------
-def compress_photo_for_storage(image_bytes: bytes, size=(150, 150)) -> str:
-    """Thumbnail to 150x150 JPEG, return base64 string for Google Sheets storage."""
-    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-    img.thumbnail(size, Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format='JPEG', quality=85)
-    return base64.b64encode(buf.getvalue()).decode()
+def generate_qr_image(admission_no: str, name: str) -> Image.Image:
+    """Generate a QR code PIL Image with student name and admission number label."""
+    qr = qrcode.QRCode(version=1, box_size=8, border=3,
+                       error_correction=qrcode.constants.ERROR_CORRECT_H)
+    qr.add_data(admission_no)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
 
-def compress_photo_for_api(image_bytes: bytes, max_size=(512, 512)) -> str:
-    """Resize to max 512x512 JPEG, return base64 string for Claude API."""
-    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-    img.thumbnail(max_size, Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format='JPEG', quality=85)
-    return base64.b64encode(buf.getvalue()).decode()
+    qr_w, qr_h = qr_img.size
+    label_h = 44
+    cell = Image.new('RGB', (qr_w, qr_h + label_h), 'white')
+    cell.paste(qr_img, (0, 0))
 
-# ---------------------------
-# Student photo enrollment
-# ---------------------------
-def enroll_student_photo(admission_no: str, name: str, photo_bytes: bytes) -> bool:
-    """Save a student reference photo to the StudentPhotos sheet (upsert)."""
+    draw = ImageDraw.Draw(cell)
     try:
-        photo_b64 = compress_photo_for_storage(photo_bytes)
-        df = read_sheet("StudentPhotos")
-        new_row = pd.DataFrame([{'Admission_No': admission_no, 'Name': name, 'PhotoData': photo_b64}])
-        if df is None or df.empty:
-            df = new_row
-        else:
-            mask = df['Admission_No'] == admission_no
-            if mask.any():
-                df.loc[mask, 'Name'] = name
-                df.loc[mask, 'PhotoData'] = photo_b64
-            else:
-                df = pd.concat([df, new_row], ignore_index=True)
-        success = write_sheet("StudentPhotos", df)
-        if success:
-            st.session_state.student_photos[admission_no] = {"name": name, "photo_b64": photo_b64}
-        return success
-    except Exception as e:
-        st.error(f"Enrollment failed: {str(e)}")
-        return False
-
-def load_student_photos() -> dict:
-    """Load all student reference photos from the StudentPhotos sheet."""
-    df = read_sheet("StudentPhotos")
-    if df is None or df.empty:
-        return {}
-    photos = {}
-    for _, row in df.iterrows():
-        adm = str(row.get('Admission_No', '')).strip()
-        photo_b64 = str(row.get('PhotoData', '')).strip()
-        name = str(row.get('Name', '')).strip()
-        if adm and photo_b64:
-            photos[adm] = {"name": name, "photo_b64": photo_b64}
-    return photos
-
-# ---------------------------
-# Claude Vision identification
-# ---------------------------
-def parse_claude_response(response_text: str, enrolled_admission_nos: list) -> dict:
-    """Parse Claude's JSON response into {admission_no: 'P'/'A'/'?'}."""
-    results = {adm: 'A' for adm in enrolled_admission_nos}
-    try:
-        # Extract JSON from response (Claude may include surrounding text)
-        text = response_text.strip()
-        start = text.find('{')
-        end = text.rfind('}') + 1
-        if start >= 0 and end > start:
-            data = json.loads(text[start:end])
-            for adm in data.get('present', []):
-                if adm in results:
-                    results[adm] = 'P'
-            for adm in data.get('uncertain', []):
-                if adm in results:
-                    results[adm] = '?'
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
     except Exception:
-        pass
+        font = ImageFont.load_default()
+        font_small = font
+
+    # Truncate long names
+    display_name = name if len(name) <= 20 else name[:18] + ".."
+    draw.text((4, qr_h + 4), display_name, fill='black', font=font)
+    draw.text((4, qr_h + 20), admission_no, fill='#555555', font=font_small)
+    draw.rectangle([0, 0, qr_w - 1, qr_h + label_h - 1], outline='#cccccc', width=1)
+    return cell
+
+def generate_printable_qr_sheet(roster: pd.DataFrame) -> bytes:
+    """Create a printable PNG sheet with all student QR codes in a 4-column grid."""
+    cols = 4
+    padding = 16
+    sample_qr = generate_qr_image("SAMPLE", "Sample")
+    cell_w, cell_h = sample_qr.size
+
+    n = len(roster)
+    rows = math.ceil(n / cols)
+    sheet_w = cols * cell_w + (cols + 1) * padding
+    sheet_h = rows * cell_h + (rows + 1) * padding + 50  # +50 for header
+
+    sheet = Image.new('RGB', (sheet_w, sheet_h), 'white')
+    draw = ImageDraw.Draw(sheet)
+
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+    except Exception:
+        font_title = ImageFont.load_default()
+
+    draw.text((padding, 12), "Student QR Attendance Cards  —  Print, cut & distribute (one-time)", fill='#333333', font=font_title)
+
+    for i, (_, row) in enumerate(roster.iterrows()):
+        col_idx = i % cols
+        row_idx = i // cols
+        x = padding + col_idx * (cell_w + padding)
+        y = 50 + padding + row_idx * (cell_h + padding)
+        qr_cell = generate_qr_image(str(row['Admission_No']), str(row['Name']))
+        sheet.paste(qr_cell, (x, y))
+
+    buf = io.BytesIO()
+    sheet.save(buf, format='PNG')
+    return buf.getvalue()
+
+def scan_qr_codes(image_bytes: bytes) -> list:
+    """Detect all QR codes in a single image. Returns list of decoded strings."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        decoded = pyzbar.decode(img)
+        codes = [d.data.decode('utf-8').strip() for d in decoded]
+        return codes
+    except Exception as e:
+        st.error(f"QR scan error: {str(e)}")
+        return []
+
+def match_qr_to_roster(detected_codes: list, roster: pd.DataFrame) -> dict:
+    """Cross-reference detected QR codes against roster admission numbers."""
+    roster_admissions = set(roster['Admission_No'].astype(str).tolist())
+    results = {adm: 'A' for adm in roster_admissions}
+    for code in detected_codes:
+        if code in roster_admissions:
+            results[code] = 'P'
     return results
-
-def identify_attendance_with_claude(
-    class_photo_bytes: bytes,
-    enrolled_students: list,
-    api_key: str,
-    model: str = "claude-haiku-4-5-20251001",
-    batch_size: int = 10
-) -> dict:
-    """
-    Identify present students using Claude Vision API.
-    enrolled_students: [{"admission_no": str, "name": str, "photo_b64": str}]
-    Returns {admission_no: "P"/"A"/"?"}
-    """
-    client = anthropic.Anthropic(api_key=api_key)
-    class_photo_b64 = compress_photo_for_api(class_photo_bytes)
-    all_results = {}
-
-    batches = [enrolled_students[i:i+batch_size] for i in range(0, len(enrolled_students), batch_size)]
-    progress = st.progress(0, text="Asking Claude to identify students...")
-
-    for batch_num, batch in enumerate(batches):
-        progress.progress(
-            int((batch_num / len(batches)) * 100),
-            text=f"Processing batch {batch_num + 1}/{len(batches)}..."
-        )
-        content = [
-            {
-                "type": "text",
-                "text": (
-                    "You are an attendance tracking assistant. "
-                    "Below are reference photos of students, followed by a classroom photo. "
-                    "Compare each student's reference photo to the faces visible in the classroom photo. "
-                    "Determine which students are physically present in the classroom photo.\n\n"
-                    "REFERENCE PHOTOS:"
-                )
-            }
-        ]
-
-        for student in batch:
-            content.append({
-                "type": "text",
-                "text": f"Student ID: {student['admission_no']} — {student['name']}"
-            })
-            content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": student['photo_b64']
-                }
-            })
-
-        content.append({
-            "type": "text",
-            "text": "CLASSROOM PHOTO (identify which students above are present in this photo):"
-        })
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": class_photo_b64
-            }
-        })
-        content.append({
-            "type": "text",
-            "text": (
-                'Respond with ONLY a valid JSON object in this exact format (no extra text):\n'
-                '{"present": ["ADM001", "ADM003"], "absent": ["ADM002"], "uncertain": ["ADM004"]}\n'
-                'Every student ID from the reference photos must appear in exactly one list.'
-            )
-        })
-
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=512,
-                messages=[{"role": "user", "content": content}]
-            )
-            response_text = response.content[0].text
-            batch_admission_nos = [s['admission_no'] for s in batch]
-            batch_results = parse_claude_response(response_text, batch_admission_nos)
-            all_results.update(batch_results)
-        except Exception as e:
-            st.warning(f"Batch {batch_num + 1} error: {str(e)}")
-            for student in batch:
-                all_results[student['admission_no']] = '?'
-
-    progress.progress(100, text="Done!")
-    return all_results
 
 # ---------------------------
 # Main App
 # ---------------------------
 def main():
-    st.title("✨ Face Attendance (Claude Vision)")
+    st.title("📱 QR Bulk Attendance System")
 
-    with st.expander("⚙️ SETUP INSTRUCTIONS (First Time Only)", expanded=not st.session_state.sheets_connected):
+    # Setup instructions
+    with st.expander("⚙️ HOW IT WORKS (First Time Setup)", expanded=not st.session_state.sheets_connected):
         st.markdown("""
         ### One-Time Setup
-        1. Create a Google Sheet and enable the **Google Sheets API**
-        2. Create a **Service Account** key (JSON)
-        3. Share the Sheet with the service account email as *Editor*
-        4. Get an **Anthropic API key** from console.anthropic.com
-        5. Add to Streamlit secrets: `ANTHROPIC_API_KEY`, `spreadsheet_id`, `gcp_service_account`
+        1. Connect your **Google Sheet** below (service account credentials + spreadsheet ID)
+        2. Upload your **roster CSV** — columns: `Admission_No, Name, Section, Roll_No`
+        3. Go to **🖨️ Print QR Codes** tab → download the QR sheet → print & cut
+        4. Give each student their QR card — they keep it for the whole year
+
+        ### Daily Attendance (takes ~10 seconds)
+        1. Upload today's roster (or load from Sheets)
+        2. Students hold up their QR cards facing your phone camera
+        3. Take **one group photo**
+        4. Upload it → click **Scan QR Codes**
+        5. Review results → Save to Google Sheets
         """)
 
     st.markdown("---")
 
-    # Connection UI
+    # ---------------------------
+    # Google Sheets connection
+    # ---------------------------
     if not st.session_state.sheets_connected:
         st.subheader("🔗 Connect to Google Sheets")
         auto_connected = False
         try:
             if "gcp_service_account" in st.secrets and "spreadsheet_id" in st.secrets:
-                with st.spinner("Connecting to Google Sheets..."):
-                    credentials_dict = dict(st.secrets["gcp_service_account"])
-                    spreadsheet_id = st.secrets["spreadsheet_id"]
-                    if connect_to_sheets(credentials_dict, spreadsheet_id):
+                with st.spinner("Connecting..."):
+                    if connect_to_sheets(dict(st.secrets["gcp_service_account"]), st.secrets["spreadsheet_id"]):
                         st.success("✅ Connected to Google Sheets!")
                         auto_connected = True
                         roster = read_sheet("Roster")
                         if roster is not None and not roster.empty:
                             st.session_state.roster = roster
                             st.success(f"✅ Loaded roster: {len(roster)} students")
-                        photos = load_student_photos()
-                        if photos:
-                            st.session_state.student_photos = photos
-                            st.info(f"📸 Loaded {len(photos)} enrolled student photos")
         except Exception as e:
             st.error(f"Auto connect failed: {e}")
 
         if not auto_connected:
-            st.info("Provide credentials manually if secrets are not configured.")
             creds_method = st.radio("Credentials method", ["Upload JSON", "Paste JSON"], horizontal=True)
             credentials_dict = None
             if creds_method == "Upload JSON":
@@ -441,13 +352,9 @@ def main():
                     st.error("Provide both credentials and Spreadsheet ID")
                 else:
                     if connect_to_sheets(credentials_dict, spreadsheet_id):
-                        st.success("✅ Connected!")
                         roster = read_sheet("Roster")
                         if roster is not None and not roster.empty:
                             st.session_state.roster = roster
-                        photos = load_student_photos()
-                        if photos:
-                            st.session_state.student_photos = photos
                         st.rerun()
             st.stop()
 
@@ -461,26 +368,6 @@ def main():
         st.metric("📅 Date", datetime.now().strftime('%b %d, %Y'))
         st.markdown("---")
 
-        # Anthropic API key
-        st.subheader("🤖 Claude API Key")
-        default_key = ""
-        try:
-            default_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-        except Exception:
-            pass
-        api_key_input = st.text_input(
-            "Anthropic API Key",
-            value=default_key,
-            type="password",
-            placeholder="sk-ant-...",
-            help="From console.anthropic.com"
-        )
-        if api_key_input:
-            st.session_state.anthropic_key = api_key_input
-
-        st.markdown("---")
-
-        # Roster
         st.subheader("👥 Roster")
         if st.button("📥 Load Roster from Sheets", use_container_width=True):
             roster = read_sheet("Roster")
@@ -491,8 +378,7 @@ def main():
                 st.info("No roster found. Upload CSV below.")
 
         roster_file = st.file_uploader(
-            "Upload Roster CSV",
-            type=['csv'],
+            "Upload Roster CSV", type=['csv'],
             help="Columns: Admission_No, Name, Section, Roll_No"
         )
         if roster_file:
@@ -513,191 +399,171 @@ def main():
 
         st.markdown("---")
 
-        # Student enrollment
-        st.subheader("📸 Enroll Students")
-        enrolled_count = len(st.session_state.student_photos)
-        st.caption(f"{enrolled_count} students enrolled with reference photos")
-
-        if st.button("🔄 Reload Enrolled Photos", use_container_width=True):
-            photos = load_student_photos()
-            st.session_state.student_photos = photos
-            st.success(f"Loaded {len(photos)} photos")
-
-        if st.session_state.roster is not None:
-            roster_df = st.session_state.roster
-            student_options = [
-                f"{row['Name']} ({row['Admission_No']})"
-                for _, row in roster_df.iterrows()
-            ]
-            selected_student_label = st.selectbox("Select student to enroll", student_options)
-            enroll_photo = st.file_uploader(
-                "Upload reference photo",
-                type=['jpg', 'jpeg', 'png'],
-                key="enroll_photo"
-            )
-            if st.button("✅ Enroll Student", use_container_width=True):
-                if enroll_photo and selected_student_label:
-                    idx = student_options.index(selected_student_label)
-                    row = roster_df.iloc[idx]
-                    admission_no = row['Admission_No']
-                    name = row['Name']
-                    photo_bytes = enroll_photo.read()
-                    with st.spinner("Enrolling..."):
-                        if enroll_student_photo(admission_no, name, photo_bytes):
-                            st.success(f"✅ Enrolled {name}")
-                        else:
-                            st.error("Enrollment failed")
-                else:
-                    st.warning("Select a student and upload a photo")
-
-        st.markdown("---")
-
-        # Today's photo
         st.subheader("📷 Today's Photo")
-        photo_file = st.file_uploader("Upload classroom photo", type=['jpg', 'jpeg', 'png'])
+        photo_file = st.file_uploader(
+            "Upload classroom photo", type=['jpg', 'jpeg', 'png'],
+            help="Students should be holding their QR cards facing the camera"
+        )
         if photo_file:
-            photo_bytes = photo_file.read()
-            st.session_state.photo = Image.open(io.BytesIO(photo_bytes)).convert('RGB')
-            st.session_state.photo_bytes = photo_bytes
-            st.session_state.analysis_done = False
-            st.session_state.claude_results = {}
+            st.session_state.photo_bytes = photo_file.read()
+            st.session_state.scan_done = False
+            st.session_state.scan_results = {}
+            st.session_state.detected_codes = []
             st.success("✅ Photo loaded")
 
-        st.markdown("---")
+        if st.session_state.photo_bytes:
+            if st.button("🔍 Scan QR Codes", use_container_width=True, type="primary"):
+                if st.session_state.roster is None:
+                    st.error("❌ Load roster first")
+                else:
+                    with st.spinner("Scanning for QR codes..."):
+                        codes = scan_qr_codes(st.session_state.photo_bytes)
+                        st.session_state.detected_codes = codes
+                        results = match_qr_to_roster(codes, st.session_state.roster)
+                        st.session_state.scan_results = results
+                        st.session_state.scan_done = True
+                    present = sum(1 for v in results.values() if v == 'P')
+                    st.success(f"✅ Found {len(codes)} QR codes → {present} students present")
+                    st.rerun()
 
+        st.markdown("---")
         if st.button("📊 View Master Sheet", use_container_width=True):
             st.session_state.show_master = not st.session_state.show_master
             st.rerun()
 
     # ---------------------------
-    # Main content
+    # Main tabs
     # ---------------------------
-    col1, col2 = st.columns([3, 2])
+    tab1, tab2 = st.tabs(["📸 Take Attendance", "🖨️ Print QR Codes"])
 
-    with col1:
-        st.subheader("📷 Classroom Photo")
-        if st.session_state.photo is not None:
-            st.image(st.session_state.photo, use_container_width=True)
+    # ---- TAB 1: TAKE ATTENDANCE ----
+    with tab1:
+        if st.session_state.photo_bytes:
+            img = Image.open(io.BytesIO(st.session_state.photo_bytes))
+            st.image(img, caption="Uploaded classroom photo", use_container_width=True)
         else:
-            st.info("👈 Upload today's classroom photo in the sidebar")
+            st.info("👈 Upload today's classroom photo in the sidebar, then click **Scan QR Codes**")
 
-    with col2:
-        st.subheader("🤖 Claude Analysis")
+        if st.session_state.scan_done and st.session_state.scan_results:
+            results = st.session_state.scan_results
+            roster_df = st.session_state.roster
+            present_count = sum(1 for v in results.values() if v == 'P')
+            absent_count = sum(1 for v in results.values() if v == 'A')
+            total = len(roster_df)
+            unknown = [c for c in st.session_state.detected_codes
+                       if c not in set(roster_df['Admission_No'].astype(str).tolist())]
 
-        if st.session_state.photo is None:
-            st.info("Upload a classroom photo first")
-        elif not st.session_state.student_photos:
-            st.warning("No enrolled students found. Enroll students with reference photos first.")
-        elif not st.session_state.get('anthropic_key'):
-            st.warning("Enter your Anthropic API key in the sidebar")
-        else:
-            enrolled_in_roster = []
-            if st.session_state.roster is not None:
-                for _, row in st.session_state.roster.iterrows():
-                    adm = row['Admission_No']
-                    if adm in st.session_state.student_photos:
-                        enrolled_in_roster.append({
-                            "admission_no": adm,
-                            "name": row['Name'],
-                            "photo_b64": st.session_state.student_photos[adm]['photo_b64']
-                        })
+            # Metrics
+            st.markdown("---")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Present", present_count)
+            m2.metric("Absent", absent_count)
+            m3.metric("Rate", f"{present_count / total * 100:.1f}%" if total else "0%")
+            m4.metric("Unknown codes", len(unknown),
+                      help="QR codes detected but not in roster")
 
-            st.info(
-                f"📸 {len(enrolled_in_roster)} of {len(st.session_state.roster) if st.session_state.roster is not None else 0} "
-                f"students have reference photos"
-            )
+            if unknown:
+                st.warning(f"⚠️ {len(unknown)} unrecognised QR code(s): {', '.join(unknown)}")
 
-            if st.button("🔍 Identify Attendance with Claude", use_container_width=True, type="primary"):
-                if not enrolled_in_roster:
-                    st.error("No students with reference photos found in the current roster")
-                else:
-                    with st.spinner("Sending to Claude Vision API..."):
-                        results = identify_attendance_with_claude(
-                            class_photo_bytes=st.session_state.photo_bytes,
-                            enrolled_students=enrolled_in_roster,
-                            api_key=st.session_state.anthropic_key
-                        )
-                    st.session_state.claude_results = results
-                    st.session_state.analysis_done = True
-                    st.rerun()
+            # Review & correct
+            st.markdown("---")
+            st.subheader("✏️ Review & Correct")
+            st.caption("Results are pre-filled from the scan. Adjust any mistakes before saving.")
 
-    # ---------------------------
-    # Review & Save section
-    # ---------------------------
-    if st.session_state.analysis_done and st.session_state.claude_results and st.session_state.roster is not None:
-        st.markdown("---")
-        st.subheader("✏️ Review & Correct Attendance")
-        st.caption("Claude's results are pre-filled. Correct any mistakes before saving.")
+            with st.form("review_form"):
+                updated = {}
+                cols_per_row = 3
+                rows_data = [
+                    {"Admission_No": r['Admission_No'], "Name": r['Name'],
+                     "Section": r['Section'], "Status": results.get(str(r['Admission_No']), 'A')}
+                    for _, r in roster_df.iterrows()
+                ]
+                grouped = [rows_data[i:i+cols_per_row] for i in range(0, len(rows_data), cols_per_row)]
 
-        results = dict(st.session_state.claude_results)
-        roster_df = st.session_state.roster
+                for group in grouped:
+                    fcols = st.columns(cols_per_row)
+                    for fc, student in zip(fcols, group):
+                        with fc:
+                            adm = student['Admission_No']
+                            badge = "🟢" if student['Status'] == 'P' else "🔴"
+                            updated[adm] = st.selectbox(
+                                f"{badge} {student['Name']}",
+                                options=['P', 'A'],
+                                index=0 if student['Status'] == 'P' else 1,
+                                key=f"s_{adm}"
+                            )
 
-        # Build editable table
-        review_data = []
-        for _, row in roster_df.iterrows():
-            adm = row['Admission_No']
-            current_status = results.get(adm, 'A')
-            has_photo = adm in st.session_state.student_photos
-            review_data.append({
-                "Admission_No": adm,
-                "Name": row['Name'],
-                "Section": row['Section'],
-                "Roll_No": row['Roll_No'],
-                "Status": current_status,
-                "Has Photo": "✅" if has_photo else "❌"
-            })
+                save_btn = st.form_submit_button(
+                    "✅ SAVE TO GOOGLE SHEETS", use_container_width=True, type="primary"
+                )
 
-        review_df = pd.DataFrame(review_data)
-
-        # Summary metrics
-        present_count = sum(1 for s in results.values() if s == 'P')
-        absent_count = sum(1 for s in results.values() if s == 'A')
-        uncertain_count = sum(1 for s in results.values() if s == '?')
-        total = len(roster_df)
-
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Present", present_count)
-        mc2.metric("Absent", absent_count)
-        mc3.metric("Uncertain (?)", uncertain_count)
-        mc4.metric("Rate", f"{present_count/total*100:.1f}%" if total else "0%")
-
-        # Editable status per student
-        st.markdown("**Adjust statuses if needed (P = Present, A = Absent):**")
-
-        with st.form("review_form"):
-            updated_results = {}
-            cols_per_row = 3
-            student_rows = [review_data[i:i+cols_per_row] for i in range(0, len(review_data), cols_per_row)]
-
-            for row_group in student_rows:
-                form_cols = st.columns(cols_per_row)
-                for fc, student in zip(form_cols, row_group):
-                    with fc:
-                        adm = student['Admission_No']
-                        key = f"status_{adm}"
-                        badge = "🟢" if student['Status'] == 'P' else ("🟡" if student['Status'] == '?' else "🔴")
-                        new_status = st.selectbox(
-                            f"{badge} {student['Name']}",
-                            options=['P', 'A', '?'],
-                            index=['P', 'A', '?'].index(student['Status']),
-                            key=key
-                        )
-                        updated_results[adm] = new_status
-
-            submitted = st.form_submit_button("✅ SAVE TO GOOGLE SHEETS", use_container_width=True, type="primary")
-
-        if submitted:
-            with st.spinner("Saving attendance..."):
-                today = datetime.now().strftime('%Y-%m-%d')
-                master = update_master_attendance(roster_df, updated_results, today)
-                present_final = sum(1 for s in updated_results.values() if s == 'P')
-                st.success(f"✅ Attendance saved for {today}! {present_final} present, {total - present_final} absent.")
+            if save_btn:
+                with st.spinner("Saving..."):
+                    today = datetime.now().strftime('%Y-%m-%d')
+                    update_master_attendance(roster_df, updated, today)
+                    final_present = sum(1 for v in updated.values() if v == 'P')
+                st.success(f"✅ Saved for {today}! {final_present} present, {total - final_present} absent.")
                 st.balloons()
-                st.session_state.claude_results = updated_results
+                st.session_state.scan_results = updated
 
-    elif st.session_state.roster is not None and not st.session_state.analysis_done:
-        st.markdown("---")
-        st.info("Upload a classroom photo and click 'Identify Attendance with Claude' to begin.")
+    # ---- TAB 2: PRINT QR CODES ----
+    with tab2:
+        st.subheader("🖨️ Student QR Code Cards")
+
+        if st.session_state.roster is None:
+            st.info("Load a roster first (sidebar) to generate QR codes.")
+        else:
+            roster_df = st.session_state.roster
+            st.markdown(f"""
+            **{len(roster_df)} students** in the current roster.
+
+            - Click **Download QR Sheet** to get a printable PNG
+            - Print at full size (A4 / Letter), cut along the card borders
+            - Give each student their card — **one-time only**
+            - Students keep the card and hold it up for every class photo
+            """)
+
+            col_dl, col_prev = st.columns([1, 2])
+
+            with col_dl:
+                if st.button("📥 Generate & Download QR Sheet", use_container_width=True, type="primary"):
+                    with st.spinner("Generating QR codes..."):
+                        sheet_bytes = generate_printable_qr_sheet(roster_df)
+                    st.download_button(
+                        label="⬇️ Download QR Sheet (PNG)",
+                        data=sheet_bytes,
+                        file_name=f"qr_cards_{datetime.now().strftime('%Y%m%d')}.png",
+                        mime="image/png",
+                        use_container_width=True
+                    )
+
+                st.markdown("---")
+                st.markdown("**Individual QR code lookup:**")
+                search = st.text_input("Search student", placeholder="Name or Admission No")
+                filtered = search_roster(roster_df, search) if search else roster_df.head(5)
+
+                for _, row in filtered.head(5).iterrows():
+                    with st.expander(f"{row['Name']} — {row['Admission_No']}"):
+                        qr_img = generate_qr_image(str(row['Admission_No']), str(row['Name']))
+                        st.image(qr_img, width=160)
+                        buf = io.BytesIO()
+                        qr_img.save(buf, format='PNG')
+                        st.download_button(
+                            "⬇️ Download",
+                            data=buf.getvalue(),
+                            file_name=f"qr_{row['Admission_No']}.png",
+                            mime="image/png",
+                            key=f"dl_{row['Admission_No']}"
+                        )
+
+            with col_prev:
+                st.markdown("**Preview (first 8 students):**")
+                preview_roster = roster_df.head(8)
+                cols = st.columns(4)
+                for i, (_, row) in enumerate(preview_roster.iterrows()):
+                    with cols[i % 4]:
+                        qr_img = generate_qr_image(str(row['Admission_No']), str(row['Name']))
+                        st.image(qr_img, use_container_width=True)
 
     # ---------------------------
     # Master attendance view
@@ -710,10 +576,9 @@ def main():
             st.dataframe(master, use_container_width=True, height=400)
             c1, c2 = st.columns(2)
             with c1:
-                csv = master.to_csv(index=False)
                 st.download_button(
                     "📥 Download CSV",
-                    csv,
+                    master.to_csv(index=False),
                     f"attendance_{datetime.now().strftime('%Y%m%d')}.csv",
                     use_container_width=True
                 )
@@ -733,7 +598,7 @@ def main():
 
     st.markdown("---")
     st.markdown(
-        "<center>📚 Face Attendance System (Claude Vision) | Data in Google Sheets ☁️</center>",
+        "<center>📱 QR Attendance System | No AI · No API costs · Works offline · Data in Google Sheets ☁️</center>",
         unsafe_allow_html=True
     )
 
