@@ -94,7 +94,7 @@ def build_daily_csv(roster: pd.DataFrame, results: dict, date_str: str) -> bytes
             'Name': row['Name'],
             'Roll_No': row.get('Roll_No', ''),
             'Section': row.get('Section', ''),
-            'Status': results.get(adm, 'A'),
+            date_str: results.get(adm, 'A'),
         })
     df = pd.DataFrame(rows)
     return df.to_csv(index=False).encode('utf-8')
@@ -389,7 +389,7 @@ def main():
                     type="primary"
                 )
                 st.caption(
-                    "Paste the **Status** column into your master Excel sheet under today's date. "
+                    "Paste the date column into your master Excel sheet — the header is already today's date. "
                     "Students are sorted by Admission_No — consistent every session."
                 )
 
