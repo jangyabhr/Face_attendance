@@ -50,6 +50,8 @@ if 'daily_csv' not in st.session_state:
     st.session_state.daily_csv = None       # bytes of last saved daily CSV
 if 'daily_csv_date' not in st.session_state:
     st.session_state.daily_csv_date = None  # date string for filename
+if 'current_photo_key' not in st.session_state:
+    st.session_state.current_photo_key = None  # name_size key to detect new uploads
 
 # ---------------------------
 # Roster helpers
@@ -269,12 +271,15 @@ def main():
             help="Students should be holding their QR cards facing the camera"
         )
         if photo_file:
-            st.session_state.photo_bytes = photo_file.read()
-            st.session_state.scan_done = False
-            st.session_state.scan_results = {}
-            st.session_state.detected_codes = []
-            st.session_state.daily_csv = None
-            st.success("✅ Photo loaded")
+            file_key = f"{photo_file.name}_{photo_file.size}"
+            if file_key != st.session_state.current_photo_key:
+                st.session_state.current_photo_key = file_key
+                st.session_state.photo_bytes = photo_file.read()
+                st.session_state.scan_done = False
+                st.session_state.scan_results = {}
+                st.session_state.detected_codes = []
+                st.session_state.daily_csv = None
+                st.success("✅ Photo loaded")
 
         if st.session_state.photo_bytes:
             if st.button("🔍 Scan QR Codes", use_container_width=True, type="primary"):
