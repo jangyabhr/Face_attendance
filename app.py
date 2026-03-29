@@ -104,35 +104,35 @@ def build_daily_csv(roster: pd.DataFrame, results: dict, date_str: str) -> bytes
 # ---------------------------
 def generate_qr_image(admission_no: str, name: str) -> Image.Image:
     """Generate a QR code PIL Image with student name and admission number label."""
-    qr = qrcode.QRCode(version=1, box_size=8, border=3,
-                       error_correction=qrcode.constants.ERROR_CORRECT_H)
+    qr = qrcode.QRCode(version=1, box_size=10, border=4,
+                       error_correction=qrcode.constants.ERROR_CORRECT_M)
     qr.add_data(admission_no)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
 
     qr_w, qr_h = qr_img.size
-    label_h = 44
+    label_h = 56
     cell = Image.new('RGB', (qr_w, qr_h + label_h), 'white')
     cell.paste(qr_img, (0, 0))
 
     draw = ImageDraw.Draw(cell)
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
     except Exception:
         font = ImageFont.load_default()
         font_small = font
 
     display_name = name if len(name) <= 20 else name[:18] + ".."
-    draw.text((4, qr_h + 4), display_name, fill='black', font=font)
-    draw.text((4, qr_h + 20), admission_no, fill='#555555', font=font_small)
+    draw.text((4, qr_h + 6), display_name, fill='black', font=font)
+    draw.text((4, qr_h + 26), admission_no, fill='#555555', font=font_small)
     draw.rectangle([0, 0, qr_w - 1, qr_h + label_h - 1], outline='#cccccc', width=1)
     return cell
 
 def generate_printable_qr_sheet(roster: pd.DataFrame) -> bytes:
-    """Create a printable PNG sheet with all student QR codes in a 4-column grid."""
-    cols = 4
-    padding = 16
+    """Create a printable PNG sheet with all student QR codes in a 3-column grid."""
+    cols = 3
+    padding = 32
     sample_qr = generate_qr_image("SAMPLE", "Sample")
     cell_w, cell_h = sample_qr.size
 
