@@ -42,16 +42,16 @@ if 'scan_results' not in st.session_state:
     st.session_state.scan_results = {}      # admission_no -> "P"/"A"
 if 'scan_done' not in st.session_state:
     st.session_state.scan_done = False
-if 'photo_bytes' not in st.session_state:
-    st.session_state.photo_bytes = None
+if 'uploaded_photos' not in st.session_state:
+    st.session_state.uploaded_photos = []           # list of {'key', 'bytes', 'name'}
+if 'uploaded_photo_keys' not in st.session_state:
+    st.session_state.uploaded_photo_keys = frozenset()  # tracks current uploader file set
 if 'detected_codes' not in st.session_state:
-    st.session_state.detected_codes = []    # raw decoded strings from photo
+    st.session_state.detected_codes = []            # union of all codes across photos
 if 'daily_csv' not in st.session_state:
-    st.session_state.daily_csv = None       # bytes of last saved daily CSV
+    st.session_state.daily_csv = None               # bytes of last saved daily CSV
 if 'daily_csv_date' not in st.session_state:
-    st.session_state.daily_csv_date = None  # date string for filename
-if 'current_photo_key' not in st.session_state:
-    st.session_state.current_photo_key = None  # name_size key to detect new uploads
+    st.session_state.daily_csv_date = None          # date string for filename
 
 # ---------------------------
 # Roster helpers
@@ -265,35 +265,44 @@ def main():
 
         st.markdown("---")
 
-        st.subheader("📷 Today's Photo")
-        photo_file = st.file_uploader(
-            "Upload classroom photo", type=['jpg', 'jpeg', 'png'],
-            help="Students should be holding their QR cards facing the camera"
+        st.subheader("📷 Today's Photos")
+        photo_files = st.file_uploader(
+            "Upload classroom photo(s)", type=['jpg', 'jpeg', 'png'],
+            accept_multiple_files=True,
+            help="Upload one photo or several — QR codes are merged across all photos"
         )
-        if photo_file:
-            file_key = f"{photo_file.name}_{photo_file.size}"
-            if file_key != st.session_state.current_photo_key:
-                st.session_state.current_photo_key = file_key
-                st.session_state.photo_bytes = photo_file.read()
+        if photo_files is not None:
+            current_keys = frozenset(f"{f.name}_{f.size}" for f in photo_files)
+            if current_keys != st.session_state.uploaded_photo_keys:
+                st.session_state.uploaded_photo_keys = current_keys
+                st.session_state.uploaded_photos = [
+                    {'key': f"{f.name}_{f.size}", 'bytes': f.read(), 'name': f.name}
+                    for f in photo_files
+                ]
                 st.session_state.scan_done = False
                 st.session_state.scan_results = {}
                 st.session_state.detected_codes = []
                 st.session_state.daily_csv = None
-                st.success("✅ Photo loaded")
+                if photo_files:
+                    st.success(f"✅ {len(photo_files)} photo(s) loaded")
 
-        if st.session_state.photo_bytes:
+        if st.session_state.uploaded_photos:
+            st.metric("Photos loaded", len(st.session_state.uploaded_photos))
             if st.button("🔍 Scan QR Codes", use_container_width=True, type="primary"):
                 if st.session_state.roster is None:
                     st.error("❌ Load roster first")
                 else:
-                    with st.spinner("Scanning for QR codes..."):
-                        codes = scan_qr_codes(st.session_state.photo_bytes)
-                        st.session_state.detected_codes = codes
-                        results = match_qr_to_roster(codes, st.session_state.roster)
+                    with st.spinner(f"Scanning {len(st.session_state.uploaded_photos)} photo(s)..."):
+                        all_codes = []
+                        for photo in st.session_state.uploaded_photos:
+                            all_codes.extend(scan_qr_codes(photo['bytes']))
+                        unique_codes = list(set(all_codes))
+                        st.session_state.detected_codes = unique_codes
+                        results = match_qr_to_roster(unique_codes, st.session_state.roster)
                         st.session_state.scan_results = results
                         st.session_state.scan_done = True
                     present = sum(1 for v in results.values() if v == 'P')
-                    st.success(f"✅ Found {len(codes)} QR codes → {present} students present")
+                    st.success(f"✅ {len(st.session_state.uploaded_photos)} photo(s) → {len(unique_codes)} unique codes → {present} present")
                     st.rerun()
 
     # ---------------------------
@@ -309,11 +318,12 @@ def main():
 
     # ---- TAB 1: TAKE ATTENDANCE ----
     with tab1:
-        if st.session_state.photo_bytes:
-            img = Image.open(io.BytesIO(st.session_state.photo_bytes))
-            st.image(img, caption="Uploaded classroom photo", use_container_width=True)
+        if st.session_state.uploaded_photos:
+            thumb_cols = st.columns(len(st.session_state.uploaded_photos))
+            for col, photo in zip(thumb_cols, st.session_state.uploaded_photos):
+                col.image(photo['bytes'], caption=photo['name'], use_container_width=True)
         else:
-            st.info("👈 Upload today's classroom photo in the sidebar, then click **Scan QR Codes**")
+            st.info("👈 Upload today's classroom photo(s) in the sidebar, then click **Scan QR Codes**")
 
         if st.session_state.scan_done and st.session_state.scan_results:
             results = st.session_state.scan_results
@@ -389,8 +399,7 @@ def main():
                     type="primary"
                 )
                 st.caption(
-                    "Paste the date column into your master Excel sheet — the header is already today's date. "
-                    "Students are sorted by Admission_No — consistent every session."
+                    "Paste the date column into your master Excel sheet — the header is already today's date."
                 )
 
     # ---- TAB 2: PRINT QR CODES ----
