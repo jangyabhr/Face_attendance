@@ -104,8 +104,8 @@ def build_daily_csv(roster: pd.DataFrame, results: dict, date_str: str) -> bytes
 # ---------------------------
 def generate_qr_image(admission_no: str, name: str) -> Image.Image:
     """Generate a QR code PIL Image with student name and admission number label."""
-    qr = qrcode.QRCode(version=1, box_size=10, border=4,
-                       error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr = qrcode.QRCode(version=1, box_size=15, border=4,
+                       error_correction=qrcode.constants.ERROR_CORRECT_L)
     qr.add_data(admission_no)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
